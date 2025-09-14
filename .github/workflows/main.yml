@@ -35,7 +35,7 @@ jobs:
             rstun-linux-x86_64/rstunc
             rstun-linux-x86_64/rstund
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
   windows-x86_64:
     name: Windows x86_64
@@ -72,4 +72,4 @@ jobs:
             rstun-windows-x86_64/rstunc.exe
             rstun-windows-x86_64/rstund.exe
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
