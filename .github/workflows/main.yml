@@ -25,7 +25,6 @@ jobs:
           mkdir -p rstun-linux-x86_64
           mv target/release/rstunc ./rstun-linux-x86_64/
           mv target/release/rstund ./rstun-linux-x86_64/
-          tar zcf rstun-linux-x86_64.tar.gz ./rstun-linux-x86_64/*
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -33,7 +32,8 @@ jobs:
           tag_name: release-${{ env.commit_id }}
           name: rstun-${{ env.commit_id }}
           files: |
-            rstun-linux-x86_64.tar.gz
+            rstun-linux-x86_64/rstunc
+            rstun-linux-x86_64/rstund
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -62,7 +62,6 @@ jobs:
           mkdir -p rstun-windows-x86_64
           mv target/release/rstunc.exe ./rstun-windows-x86_64/
           mv target/release/rstund.exe ./rstun-windows-x86_64/
-          7z a rstun-windows-x86_64.zip ./rstun-windows-x86_64/*
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -70,6 +69,7 @@ jobs:
           tag_name: release-${{ env.commit_id }}
           name: rstun-${{ env.commit_id }}
           files: |
-            rstun-windows-x86_64.zip
+            rstun-windows-x86_64/rstunc.exe
+            rstun-windows-x86_64/rstund.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
