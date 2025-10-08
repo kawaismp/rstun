@@ -31,8 +31,8 @@ impl UdpServer {
         let udp_socket = UdpSocket::bind(addr).await?;
         let addr = udp_socket.local_addr().unwrap();
 
-        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(6);
-        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(6);
+        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(4);
+        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(4);
 
         let state = Arc::new(Mutex::new(State {
             addr,
@@ -60,7 +60,7 @@ impl UdpServer {
                                 unsafe { payload.set_len(size); }
                                 let msg = UdpMessage::Packet(UdpPacket{payload, local_addr, peer_addr: None});
                                 match tokio::time::timeout(
-                                        Duration::from_millis(50),
+                                        Duration::from_millis(25),
                                         out_udp_sender.send(msg)).await {
                                     Ok(Ok(_)) => {
                                         // succeeded
