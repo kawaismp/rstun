@@ -150,6 +150,9 @@ impl Server {
             transport_cfg.max_idle_timeout(Some(timeout));
             transport_cfg
                 .keep_alive_interval(Some(Duration::from_millis(config.quic_timeout_ms * 2 / 3)));
+        } else {
+            // Default keep-alive for NAT traversal
+            transport_cfg.keep_alive_interval(Some(Duration::from_secs(5)));
         }
         transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(4096));
 

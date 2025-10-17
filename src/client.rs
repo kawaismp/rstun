@@ -550,6 +550,9 @@ impl Client {
             transport_cfg.keep_alive_interval(Some(Duration::from_millis(
                 self.config.quic_timeout_ms * 2 / 3,
             )));
+        } else {
+            // Default keep-alive for NAT traversal even without explicit timeout
+            transport_cfg.keep_alive_interval(Some(Duration::from_secs(5)));
         }
 
         let (tls_client_cfg, domain) = self.parse_client_config_and_domain()?;
