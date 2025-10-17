@@ -13,6 +13,9 @@ use tokio::sync::mpsc::channel;
 
 pub use crate::udp::{UdpMessage, UdpPacket, UdpReceiver, UdpSender};
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 #[derive(Debug, Clone)]
 /// Lightweight UDP helper that binds a local socket and bridges packets via channels.
 pub struct UdpServer(Arc<Mutex<State>>);
@@ -30,6 +33,9 @@ impl UdpServer {
     pub async fn bind_and_start(addr: SocketAddr) -> Result<Self> {
         let udp_socket = UdpSocket::bind(addr).await?;
         let addr = udp_socket.local_addr().unwrap();
+        
+        // Optimize UDP socket for performance
+        Self::optimize_udp_socket(&udp_socket);
 
         let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(2);
         let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(2);
@@ -146,5 +152,59 @@ impl UdpServer {
     /// Clone the sender used for delivering packets to the local UDP socket.
     pub fn clone_sender(&self) -> UdpSender {
         self.0.lock().in_udp_sender.clone()
+    }
+
+    /// Optimize UDP socket for high throughput
+    fn optimize_udp_socket(socket: &UdpSocket) {
+        #[cfg(unix)]
+        {
+            use libc::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+            let fd = socket.as_raw_fd();
+            
+            unsafe {
+                // Increase socket buffers significantly for UDP (2MB each)
+                // Larger buffers help prevent packet drops under high load
+                let buffer_size: libc::c_int = 2097152;
+                setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_RCVBUF,
+                    &buffer_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_SNDBUF,
+                    &buffer_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+            
+            let raw_socket = socket.as_raw_socket();
+            unsafe {
+                let buffer_size: i32 = 2097152;
+                setsockopt(
+                    raw_socket as usize,
+                    SOL_SOCKET as i32,
+                    SO_RCVBUF,
+                    &buffer_size as *const _ as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
+                setsockopt(
+                    raw_socket as usize,
+                    SOL_SOCKET as i32,
+                    SO_SNDBUF,
+                    &buffer_size as *const _ as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
+            }
+        }
     }
 }

@@ -538,11 +538,11 @@ impl Client {
     async fn prepare_login_config(&self) -> Result<LoginConfig> {
         let mut transport_cfg = TransportConfig::default();
         // Increase buffer sizes for better throughput
-        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024)); // 2MB
-        transport_cfg.receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4MB
-        transport_cfg.send_window(4 * 1024 * 1024); // 4MB
+        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4MB
+        transport_cfg.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024)); // 8MB
+        transport_cfg.send_window(8 * 1024 * 1024); // 8MB
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(2048)); // Increased for better concurrency
+        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(4096));
 
         if self.config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(self.config.quic_timeout_ms as u32));

@@ -62,7 +62,7 @@ impl StreamUtil {
 
         let (quic_to_stream_tx, quic_to_stream_rx) = oneshot::channel::<()>();
         let (stream_to_quic_tx, stream_to_quic_rx) = oneshot::channel::<()>();
-        const BUFFER_SIZE: usize = 8192;
+        const BUFFER_SIZE: usize = 32_768; // 32KB
 
         tokio::spawn(async move {
             let mut transfer_bytes = 0u64;
