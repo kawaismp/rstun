@@ -456,7 +456,8 @@ pub mod android {
     use self::jni::{JNIEnv, JavaVM};
     use super::*;
     use std::os::raw::c_void;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
     use std::thread;
 
     #[no_mangle]

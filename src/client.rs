@@ -23,14 +23,15 @@ use rustls::{
 };
 use rustls_platform_verifier::{self, BuilderVerifierExt};
 use serde::Serialize;
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::{
     fmt::Display,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{Arc, Mutex, Once},
+    sync::Arc,
     time::Duration,
 };
+use parking_lot::{Mutex, Once};
 use tokio::net::TcpStream;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S.%3f";
@@ -65,10 +66,10 @@ impl Display for ClientState {
 }
 
 struct State {
-    tcp_servers: HashMap<SocketAddr, TcpServer>,
-    udp_servers: HashMap<SocketAddr, UdpServer>,
+    tcp_servers: AHashMap<SocketAddr, TcpServer>,
+    udp_servers: AHashMap<SocketAddr, UdpServer>,
     endpoint: Option<Endpoint>,
-    connections: HashMap<SocketAddr, Connection>,
+    connections: AHashMap<SocketAddr, Connection>,
     client_state: ClientState,
     total_traffic_data: TunnelTraffic,
     tunnel_info_bridge: TunnelInfoBridge,
@@ -78,10 +79,10 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            tcp_servers: HashMap::new(),
-            udp_servers: HashMap::new(),
+            tcp_servers: AHashMap::new(),
+            udp_servers: AHashMap::new(),
             endpoint: None,
-            connections: HashMap::new(),
+            connections: AHashMap::new(),
             client_state: ClientState::Idle,
             total_traffic_data: TunnelTraffic::default(),
             tunnel_info_bridge: TunnelInfoBridge::new(),
@@ -115,7 +116,7 @@ pub struct Client {
 
 macro_rules! inner_state {
     ($self:ident, $field:ident) => {
-        (*$self.inner_state.lock().unwrap()).$field
+        (*$self.inner_state.lock()).$field
     };
 }
 
@@ -218,7 +219,7 @@ impl Client {
             loop {
                 interval.tick().await;
 
-                let endpoint = { state.lock().unwrap().endpoint.clone() };
+                let endpoint = { state.lock().endpoint.clone() };
                 if let Some(endpoint) = endpoint {
                     Self::migrate_endpoint(&endpoint).await.ok();
                 }
@@ -289,7 +290,8 @@ impl Client {
     pub fn stop(&self) {
         self.set_and_post_tunnel_state(ClientState::Stopping);
 
-        if let Ok(mut state) = self.inner_state.lock() {
+        {
+            let mut state = self.inner_state.lock();
             for mut s in state.tcp_servers.values().cloned() {
                 tokio::spawn(async move {
                     s.shutdown().await.ok();
@@ -321,7 +323,8 @@ impl Client {
         self.set_and_post_tunnel_state(ClientState::Stopping);
 
         let mut tasks = tokio::task::JoinSet::new();
-        if let Ok(mut state) = self.inner_state.lock() {
+        {
+            let mut state = self.inner_state.lock();
             for mut s in state.tcp_servers.values().cloned() {
                 tasks.spawn(async move {
                     s.shutdown().await.ok();
@@ -364,7 +367,7 @@ impl Client {
         loop {
             let connect = || async {
                 let login_cfg = self.prepare_login_config().await?;
-                let endpoint = { self.inner_state.lock().unwrap().endpoint.clone() };
+                let endpoint = { self.inner_state.lock().endpoint.clone() };
                 let endpoint = if let Some(endpoint) = endpoint {
                     Self::migrate_endpoint(&endpoint).await?;
                     endpoint
@@ -534,11 +537,12 @@ impl Client {
 
     async fn prepare_login_config(&self) -> Result<LoginConfig> {
         let mut transport_cfg = TransportConfig::default();
-        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(1024 * 1024));
-        transport_cfg.receive_window(quinn::VarInt::from_u32(1024 * 1024 * 2));
-        transport_cfg.send_window(1024 * 1024 * 2);
+        // Increase buffer sizes for better throughput
+        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024)); // 2MB
+        transport_cfg.receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4MB
+        transport_cfg.send_window(4 * 1024 * 1024); // 4MB
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(2048)); // Increased for better concurrency
 
         if self.config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(self.config.quic_timeout_ms as u32));
@@ -777,7 +781,7 @@ impl Client {
                 let mut tx_dgrams = 0;
 
                 {
-                    let connections = &state.lock().unwrap().connections;
+                    let connections = &state.lock().connections;
                     for conn in connections.values() {
                         let stats = conn.stats();
                         rx_bytes += stats.udp_rx.bytes;
@@ -788,14 +792,14 @@ impl Client {
                 }
 
                 {
-                    let total_traffic_data = &&state.lock().unwrap().total_traffic_data;
+                    let total_traffic_data = &&state.lock().total_traffic_data;
                     rx_bytes += total_traffic_data.rx_bytes;
                     tx_bytes += total_traffic_data.tx_bytes;
                     rx_dgrams += total_traffic_data.rx_dgrams;
                     tx_dgrams += total_traffic_data.tx_dgrams;
                 }
 
-                let state = state.lock().unwrap();
+                let state = state.lock();
                 let client_state = state.client_state.clone();
                 let data = TunnelTraffic {
                     rx_bytes,
@@ -981,7 +985,7 @@ impl Client {
 
     fn post_tunnel_log(&self, msg: &str) {
         info!("{msg}");
-        let state = self.inner_state.lock().unwrap();
+        let state = self.inner_state.lock();
         state.post_tunnel_info(TunnelInfo::new(
             TunnelInfoType::TunnelLog,
             Box::new(format!(
@@ -992,7 +996,7 @@ impl Client {
     }
 
     fn set_and_post_tunnel_state(&self, client_state: ClientState) {
-        let mut state = self.inner_state.lock().unwrap();
+        let mut state = self.inner_state.lock();
         state.client_state = client_state.clone();
         state.post_tunnel_info(TunnelInfo::new(
             TunnelInfoType::TunnelState,

@@ -6,7 +6,7 @@ use log::error;
 use log::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::channel;
@@ -31,8 +31,8 @@ impl UdpServer {
         let udp_socket = UdpSocket::bind(addr).await?;
         let addr = udp_socket.local_addr().unwrap();
 
-        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(3);
-        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(3);
+        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(2);
+        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(2);
 
         let state = Arc::new(Mutex::new(State {
             addr,
@@ -50,7 +50,7 @@ impl UdpServer {
                         match result {
                             Ok((size, local_addr)) => {
                                 let active = {
-                                    state.clone().lock().unwrap().active
+                                    state.clone().lock().active
                                 };
                                 if !active {
                                     debug!("drop the packet ({size}) from addr: {local_addr}");
@@ -114,37 +114,37 @@ impl UdpServer {
 
     /// Get the bound local address.
     pub fn addr(&self) -> SocketAddr {
-        self.0.lock().unwrap().addr
+        self.0.lock().addr
     }
 
     /// Ask the UDP server to shut down gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
-        let udp_sender = self.0.lock().unwrap().in_udp_sender.clone();
+        let udp_sender = self.0.lock().in_udp_sender.clone();
         udp_sender.send(UdpMessage::Quit).await?;
         Ok(())
     }
 
     /// Mark the server active/inactive. When inactive, inbound packets are dropped.
     pub fn set_active(&mut self, active: bool) {
-        self.0.lock().unwrap().active = active
+        self.0.lock().active = active
     }
 
     /// Take the receiver side of the channel for reading inbound UDP packets (activates server).
     pub fn take_receiver(&mut self) -> UdpReceiver {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock();
         state.active = true;
         state.udp_receiver.take().unwrap()
     }
 
     /// Put back a previously taken receiver (deactivates server).
     pub fn put_receiver(&mut self, udp_receiver: UdpReceiver) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock();
         state.active = false;
         state.udp_receiver = Some(udp_receiver);
     }
 
     /// Clone the sender used for delivering packets to the local UDP socket.
     pub fn clone_sender(&self) -> UdpSender {
-        self.0.lock().unwrap().in_udp_sender.clone()
+        self.0.lock().in_udp_sender.clone()
     }
 }

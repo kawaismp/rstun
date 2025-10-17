@@ -24,7 +24,8 @@ use quinn::{congestion, Connection, Endpoint, SendStream, TransportConfig};
 use rs_utilities::log_and_bail;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::Arc;
+use parking_lot::{Mutex, Once};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 
@@ -68,7 +69,7 @@ pub struct Server {
 
 macro_rules! inner_state {
     ($self:ident, $field:ident) => {
-        (*$self.inner_state.lock().unwrap()).$field
+        (*$self.inner_state.lock()).$field
     };
 }
 
@@ -82,7 +83,7 @@ impl Server {
 
     /// Bind the server endpoint and return the actual bound address.
     pub fn bind(&mut self) -> Result<SocketAddr> {
-        let mut state = self.inner_state.lock().unwrap();
+        let mut state = self.inner_state.lock();
         let config = state.config.clone();
         let addr: SocketAddr = config
             .addr
@@ -139,9 +140,10 @@ impl Server {
             .unwrap();
 
         let mut transport_cfg = TransportConfig::default();
-        transport_cfg.stream_receive_window(VarInt::from_u32(1024 * 1024));
-        transport_cfg.receive_window(VarInt::from_u32(1024 * 1024 * 2));
-        transport_cfg.send_window(1024 * 1024 * 2);
+        // Increase buffer sizes for better throughput
+        transport_cfg.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB
+        transport_cfg.receive_window(VarInt::from_u32(4 * 1024 * 1024)); // 4MB
+        transport_cfg.send_window(4 * 1024 * 1024); // 4MB
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
         if config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(config.quic_timeout_ms as u32));
@@ -149,7 +151,7 @@ impl Server {
             transport_cfg
                 .keep_alive_interval(Some(Duration::from_millis(config.quic_timeout_ms * 2 / 3)));
         }
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(2048)); // Increased for better concurrency
 
         let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(Arc::new(QuicServerConfig::try_from(tls_server_cfg)?))));
         quinn_server_cfg.transport_config(Arc::new(transport_cfg));
@@ -198,7 +200,6 @@ impl Server {
                     TunnelType::TcpIn(mut info) => {
                         state
                             .lock()
-                            .unwrap()
                             .tcp_sessions
                             .push(ConnectedTcpInSession {
                                 conn: info.conn.clone(),
@@ -222,7 +223,6 @@ impl Server {
                     TunnelType::UdpIn(mut info) => {
                         state
                             .lock()
-                            .unwrap()
                             .udp_sessions
                             .push(ConnectedUdpInSession {
                                 conn: info.conn.clone(),
@@ -402,7 +402,7 @@ impl Server {
     }
 
     fn clear_expired_sessions(state: Arc<Mutex<State>>) {
-        let mut state = state.lock().unwrap();
+        let mut state = state.lock();
         state.udp_sessions.retain(|sess| {
             if sess.conn.close_reason().is_some() {
                 let sess = sess.clone();

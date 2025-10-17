@@ -2,7 +2,8 @@ use crate::tcp::{StreamMessage, StreamReceiver, StreamRequest, StreamSender};
 use anyhow::Result;
 use log::{debug, error, info};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::channel;
@@ -30,7 +31,7 @@ impl TcpServer {
         let tcp_listener = TcpListener::bind(addr).await?;
         let addr = tcp_listener.local_addr().unwrap();
 
-        let (tcp_sender, tcp_receiver) = channel(32);
+        let (tcp_sender, tcp_receiver) = channel(128);
         let state = Arc::new(Mutex::new(State {
             addr,
             tcp_sender: tcp_sender.clone(),
@@ -46,7 +47,7 @@ impl TcpServer {
                     Ok((stream, addr)) => {
                         {
                             let (terminated, active) = {
-                                let state = state.lock().unwrap();
+                                let state = state.lock();
                                 (state.terminated, state.active)
                             };
 
@@ -100,7 +101,7 @@ impl TcpServer {
     /// Request the server to shutdown gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         let addr = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.terminated = true;
             state.addr
         };
@@ -111,25 +112,25 @@ impl TcpServer {
 
     /// Get the bound local address.
     pub fn addr(&self) -> SocketAddr {
-        self.state.lock().unwrap().addr
+        self.state.lock().addr
     }
 
     /// Take the receiver channel for accepted streams (sets server active=true).
     pub fn take_receiver(&mut self) -> StreamReceiver<TcpStream> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.active = true;
         state.tcp_receiver.take().unwrap()
     }
 
     /// Put back a previously taken receiver channel (sets server active=false).
     pub fn put_receiver(&mut self, tcp_receiver: StreamReceiver<TcpStream>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.active = false;
         state.tcp_receiver = Some(tcp_receiver);
     }
 
     /// Clone a sender to receive future stream requests.
     pub fn clone_sender(&self) -> StreamSender<TcpStream> {
-        self.state.lock().unwrap().tcp_sender.clone()
+        self.state.lock().tcp_sender.clone()
     }
 }

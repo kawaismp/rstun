@@ -6,7 +6,8 @@
 //! whenever tunnel information is available.
 
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 #[derive(Serialize, Default, Clone)]
 /// Traffic counters aggregated over time.
@@ -77,7 +78,7 @@ impl TunnelInfoBridge {
     {
         if let Some(ref listener) = self.listener {
             if let Ok(json) = serde_json::to_string(&data) {
-                listener.lock().unwrap()(json.as_str());
+                listener.lock()(json.as_str());
             }
         }
     }
