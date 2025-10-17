@@ -39,6 +39,7 @@ ctrlc = "3.5.0"
 parking_lot = { version = "0.12.5", features = ["serde"] }
 ahash = "0.8"
 libc = "0.2.177"
+snap = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }

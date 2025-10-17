@@ -3,6 +3,7 @@
 //! This module defines the messages used for controlling the tunnel
 //! lifecycle and for coordinating per-packet operations between
 //! client and server.
+use crate::compression;
 use crate::{Tunnel, TunnelMode};
 use anyhow::Result;
 use anyhow::{bail, Context};
@@ -142,22 +143,60 @@ impl TunnelMessage {
     }
 
     /// Receive a raw datagram payload into the provided buffer.
+    /// Data is automatically decompressed if it was compressed.
     pub async fn recv_raw(quic_recv: &mut RecvStream, data: &mut [u8]) -> Result<u16> {
+        // Read compression flag (1 byte)
+        let compressed = quic_recv.read_u8().await? != 0;
+        
+        // Read message length
         let msg_len = quic_recv.read_u16().await? as usize;
-        if msg_len > data.len() {
-            bail!("message too large: {msg_len}");
+        
+        if compressed {
+            // Read compressed data into a temporary buffer
+            let mut compressed_buf = vec![0u8; msg_len];
+            quic_recv
+                .read_exact(&mut compressed_buf)
+                .await
+                .context("read compressed message failed")?;
+            
+            // Decompress
+            let decompressed = compression::decompress(&compressed_buf)
+                .context("decompression failed")?;
+            
+            if decompressed.len() > data.len() {
+                bail!("decompressed message too large: {}", decompressed.len());
+            }
+            
+            data[..decompressed.len()].copy_from_slice(&decompressed);
+            Ok(decompressed.len() as u16)
+        } else {
+            // Uncompressed data
+            if msg_len > data.len() {
+                bail!("message too large: {msg_len}");
+            }
+            quic_recv
+                .read_exact(&mut data[..msg_len])
+                .await
+                .context("read message failed")?;
+            Ok(msg_len as u16)
         }
-        quic_recv
-            .read_exact(&mut data[..msg_len])
-            .await
-            .context("read message failed")?;
-        Ok(msg_len as u16)
     }
 
-    /// Send a raw datagram payload.
+    /// Send a raw datagram payload with optional compression.
+    /// Data larger than 256 bytes is automatically compressed if compression reduces size.
     pub async fn send_raw(quic_send: &mut SendStream, data: &[u8]) -> Result<()> {
-        quic_send.write_u16(data.len() as u16).await?;
-        quic_send.write_all(data).await?;
+        // Compress if worthwhile (min size: 256 bytes)
+        let (send_data, compressed) = compression::compress_if_worthwhile(data, 256)?;
+        
+        // Write compression flag (1 byte)
+        quic_send.write_u8(if compressed { 1 } else { 0 }).await?;
+        
+        // Write message length
+        quic_send.write_u16(send_data.len() as u16).await?;
+        
+        // Write data
+        quic_send.write_all(&send_data).await?;
+        
         Ok(())
     }
 

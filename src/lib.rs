@@ -7,6 +7,7 @@
 //! Binaries rstunc (client) and rstund (server) are provided under src/bin.
 
 mod client;
+mod compression;
 mod noprotection;
 mod pem_util;
 mod server;

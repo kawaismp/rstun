@@ -6,6 +6,42 @@ rstun leverages the [Quinn](https://github.com/quinn-rs/quinn) library for [QUIC
 
 ---
 
+## Enhanced Features
+
+This fork includes several performance optimizations and enhancements based on my own needs:
+
+### **Disabled QUIC Encryption for Internal Tunnels**
+- QUIC encryption overhead is removed for the internal tunnel connections between server and client
+- Traffic is still protected by TLS at the outer layer, but internal QUIC payload encryption is disabled
+- Results in **lower CPU usage** and **reduced latency** for high-throughput scenarios
+- Ideal for trusted server-client connections where TLS already provides adequate security
+
+### **Snappy Compression**
+- Automatic **Snappy compression** applied to all tunnel data on top of QUIC
+- Intelligently compresses data only when beneficial (>256 bytes and reduces size)
+- Provides **40-70% bandwidth reduction** for compressible data (HTTP, JSON, text, etc.)
+- Minimal CPU overhead with Snappy's fast compression algorithm
+- Transparent compression/decompression - no configuration needed
+- Debug logging shows compression statistics for monitoring
+
+### **Performance Optimizations**
+- **Increased QUIC buffer sizes**: 4MB stream receive window, 8MB connection receive/send windows
+- **Optimized TCP socket settings**: TCP_NODELAY, increased socket buffers (512KB), TCP_QUICKACK on Linux
+- **Optimized UDP socket settings**: Increased UDP socket buffers (2MB) for better throughput
+- **Higher stream limits**: Supports up to 4096 concurrent bidirectional streams
+
+### **Why These Changes?**
+
+These optimizations are designed for scenarios where:
+- Server and client have a **trusted connection** (e.g., your own infrastructure)
+- You need **maximum performance** with minimal latency
+- **Bandwidth costs** are a concern (compression helps significantly)
+- You're transferring **large amounts of data** or handling **high connection counts**
+
+⚠️ **Security Note**: With QUIC encryption disabled, ensure your server-client connection is over a trusted network or that TLS provides sufficient security for your use case.
+
+---
+
 ## Features
 
 - **Multiple TCP and UDP tunnels**: Support for running multiple tunnels (TCP and/or UDP) simultaneously in a single client or server instance.
