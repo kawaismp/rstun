@@ -151,8 +151,7 @@ impl Server {
         }
         transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
 
-        let quic_server_cfg = Arc::new(QuicServerConfig::try_from(tls_server_cfg)?);
-        let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(quic_server_cfg)));
+        let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(Arc::new(QuicServerConfig::try_from(tls_server_cfg)?))));
         quinn_server_cfg.transport_config(Arc::new(transport_cfg));
 
         Ok(quinn_server_cfg)

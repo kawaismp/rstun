@@ -549,8 +549,7 @@ impl Client {
         }
 
         let (tls_client_cfg, domain) = self.parse_client_config_and_domain()?;
-        let quic_client_cfg = Arc::new(QuicClientConfig::try_from(tls_client_cfg)?);
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(NoProtectionClientConfig::new(quic_client_cfg)));
+        let mut client_cfg: quinn::ClientConfig = quinn::ClientConfig::new(Arc::new(NoProtectionClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_client_cfg)?))));
         client_cfg.transport_config(Arc::new(transport_cfg));
 
         let remote_addr = self.parse_server_addr().await?;
