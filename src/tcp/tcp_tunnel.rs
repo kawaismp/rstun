@@ -38,8 +38,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::TcpStreamExt;
+#[cfg(target_os = "android")]
+use std::os::android::net::TcpStreamExt;
 
 pub struct TcpTunnel;
 
@@ -137,8 +139,13 @@ impl TcpTunnel {
                     .await
                     {
                         Ok(Ok(request)) => {
-                            // Optimize the accepted TCP stream for performance
-                            Self::optimize_tcp_stream(&request);
+                            if let Err(e) = request.set_nodelay(true) {
+                                error!("failed to set TCP_NODELAY: {e}");
+                            }
+
+                            #[cfg(any(target_os = "linux", target_os = "android"))]
+                            stream.set_quickack(true).expect("failed to set TCP_QUICKACK");
+
                             StreamUtil::start_flowing(
                                 "OUT",
                                 request,
@@ -151,77 +158,6 @@ impl TcpTunnel {
                     }
                 }),
             };
-        }
-    }
-
-    /// Optimize TCP stream for low latency and high throughput
-    fn optimize_tcp_stream(stream: &TcpStream) {
-        // Set TCP_NODELAY to disable Nagle's algorithm
-        if let Err(e) = stream.set_nodelay(true) {
-            error!("failed to set TCP_NODELAY: {e}");
-        }
-
-        #[cfg(unix)]
-        {
-            use libc::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
-            let fd = stream.as_raw_fd();
-            
-            unsafe {
-                // Increase socket buffers (512KB each)
-                let buffer_size: libc::c_int = 524288;
-                setsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_RCVBUF,
-                    &buffer_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-                setsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_SNDBUF,
-                    &buffer_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-                
-                // Enable TCP_QUICKACK on Linux for lower latency
-                #[cfg(target_os = "linux")]
-                {
-                    let quickack: libc::c_int = 1;
-                    setsockopt(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        libc::TCP_QUICKACK,
-                        &quickack as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    );
-                }
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
-            
-            let socket = stream.as_raw_socket();
-            unsafe {
-                let buffer_size: i32 = 524288;
-                setsockopt(
-                    socket as usize,
-                    SOL_SOCKET as i32,
-                    SO_RCVBUF,
-                    &buffer_size as *const _ as *const u8,
-                    std::mem::size_of::<i32>() as i32,
-                );
-                setsockopt(
-                    socket as usize,
-                    SOL_SOCKET as i32,
-                    SO_SNDBUF,
-                    &buffer_size as *const _ as *const u8,
-                    std::mem::size_of::<i32>() as i32,
-                );
-            }
         }
     }
 }
