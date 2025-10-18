@@ -140,21 +140,16 @@ impl Server {
             .unwrap();
 
         let mut transport_cfg = TransportConfig::default();
-        // Increase buffer sizes for better throughput
-        transport_cfg.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024)); // 4MB
-        transport_cfg.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8MB
-        transport_cfg.send_window(8 * 1024 * 1024); // 8MB
-        transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+        transport_cfg.stream_receive_window(VarInt::from_u32(1024 * 1024));
+        transport_cfg.receive_window(VarInt::from_u32(1024 * 1024 * 2));
+        transport_cfg.send_window(1024 * 1024 * 2);
         if config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(config.quic_timeout_ms as u32));
             transport_cfg.max_idle_timeout(Some(timeout));
             transport_cfg
                 .keep_alive_interval(Some(Duration::from_millis(config.quic_timeout_ms * 2 / 3)));
-        } else {
-            // Default keep-alive for NAT traversal
-            transport_cfg.keep_alive_interval(Some(Duration::from_secs(5)));
         }
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(4096));
+        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(2048));
 
         let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(Arc::new(QuicServerConfig::try_from(tls_server_cfg)?))));
         quinn_server_cfg.transport_config(Arc::new(transport_cfg));

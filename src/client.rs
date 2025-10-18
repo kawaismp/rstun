@@ -537,12 +537,11 @@ impl Client {
 
     async fn prepare_login_config(&self) -> Result<LoginConfig> {
         let mut transport_cfg = TransportConfig::default();
-        // Increase buffer sizes for better throughput
-        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4MB
-        transport_cfg.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024)); // 8MB
-        transport_cfg.send_window(8 * 1024 * 1024); // 8MB
+        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(1024 * 1024));
+        transport_cfg.receive_window(quinn::VarInt::from_u32(1024 * 1024 * 2));
+        transport_cfg.send_window(1024 * 1024 * 2);
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(4096));
+        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
 
         if self.config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(self.config.quic_timeout_ms as u32));
@@ -550,9 +549,6 @@ impl Client {
             transport_cfg.keep_alive_interval(Some(Duration::from_millis(
                 self.config.quic_timeout_ms * 2 / 3,
             )));
-        } else {
-            // Default keep-alive for NAT traversal even without explicit timeout
-            transport_cfg.keep_alive_interval(Some(Duration::from_secs(5)));
         }
 
         let (tls_client_cfg, domain) = self.parse_client_config_and_domain()?;
