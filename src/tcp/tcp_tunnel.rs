@@ -144,7 +144,7 @@ impl TcpTunnel {
                             }
 
                             #[cfg(any(target_os = "linux", target_os = "android"))]
-                            stream.set_quickack(true).expect("failed to set TCP_QUICKACK");
+                            request.set_quickack(true).expect("failed to set TCP_QUICKACK");
 
                             StreamUtil::start_flowing(
                                 "OUT",
