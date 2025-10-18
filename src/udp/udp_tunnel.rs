@@ -320,9 +320,6 @@ impl UdpTunnel {
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         match UdpSocket::bind(local_addr).await {
             Ok(udp_socket) => {
-                // Optimize UDP socket performance
-                Self::optimize_udp_socket(&udp_socket);
-                
                 if let Err(e) = udp_socket.connect(addr).await {
                     log_and_bail!("failed to connect to upstream: {addr}, err: {e}");
                 };
@@ -341,59 +338,6 @@ impl UdpTunnel {
             }
             Err(e) => {
                 log_and_bail!("failed to bind to localhost, err: {e}");
-            }
-        }
-    }
-
-    /// Optimize UDP socket for high throughput
-    fn optimize_udp_socket(socket: &UdpSocket) {
-        #[cfg(unix)]
-        {
-            use libc::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
-            let fd = socket.as_raw_fd();
-            
-            unsafe {
-                // Increase socket buffers (2MB each)
-                let buffer_size: libc::c_int = 2097152;
-                setsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_RCVBUF,
-                    &buffer_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-                setsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_SNDBUF,
-                    &buffer_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
-            
-            let raw_socket = socket.as_raw_socket();
-            unsafe {
-                let buffer_size: i32 = 2097152;
-                setsockopt(
-                    raw_socket as usize,
-                    SOL_SOCKET as i32,
-                    SO_RCVBUF,
-                    &buffer_size as *const _ as *const u8,
-                    std::mem::size_of::<i32>() as i32,
-                );
-                setsockopt(
-                    raw_socket as usize,
-                    SOL_SOCKET as i32,
-                    SO_SNDBUF,
-                    &buffer_size as *const _ as *const u8,
-                    std::mem::size_of::<i32>() as i32,
-                );
             }
         }
     }
