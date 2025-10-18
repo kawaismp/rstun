@@ -37,8 +37,8 @@ impl UdpServer {
         // Optimize UDP socket for performance
         Self::optimize_udp_socket(&udp_socket);
 
-        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(2);
-        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(2);
+        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(3);
+        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(3);
 
         let state = Arc::new(Mutex::new(State {
             addr,
