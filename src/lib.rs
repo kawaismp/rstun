@@ -47,7 +47,7 @@ pub const TUNNEL_MODE_IN: &str = "IN";
 /// Human-readable tunnel direction used in CLI/config strings.
 pub const TUNNEL_MODE_OUT: &str = "OUT";
 /// Maximum UDP payload size (bytes) used by this crate.
-pub const UDP_PACKET_SIZE: usize = 1300;
+pub const UDP_PACKET_SIZE: usize = 1350;
 
 lazy_static! {
     static ref BUFFER_POOL: BytePool::<Vec<u8>> = BytePool::<Vec<u8>>::new();
