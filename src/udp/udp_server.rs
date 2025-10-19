@@ -4,8 +4,10 @@ use anyhow::Result;
 use log::debug;
 use log::error;
 use log::info;
+use log::warn;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -45,71 +47,75 @@ impl UdpServer {
         }));
         let state_clone = state.clone();
 
+        // Split socket for concurrent recv/send
+        let udp_socket = Arc::new(udp_socket);
+        let recv_socket = udp_socket.clone();
+        let send_socket = udp_socket.clone();
+
+        // Spawn separate recv task
+        let recv_state = state.clone();
         tokio::spawn(async move {
             loop {
                 let mut payload = BUFFER_POOL.alloc_and_fill(UDP_PACKET_SIZE);
-                tokio::select! {
-                    result = udp_socket.recv_from(&mut payload) => {
-                        match result {
-                            Ok((size, local_addr)) => {
-                                let active = {
-                                    state.clone().lock().active
-                                };
-                                if !active {
-                                    debug!("drop the packet ({size}) from addr: {local_addr}");
-                                    continue;
-                                }
+                match recv_socket.recv_from(&mut payload).await {
+                    Ok((size, local_addr)) => {
+                        let active = recv_state.lock().active;
+                        if !active {
+                            debug!("drop the packet ({size}) from addr: {local_addr}");
+                            continue;
+                        }
 
-                                unsafe { payload.set_len(size); }
-                                let msg = UdpMessage::Packet(UdpPacket{payload, local_addr, peer_addr: None});
-                                match tokio::time::timeout(
-                                        Duration::from_millis(20),
-                                        out_udp_sender.send(msg)).await {
-                                    Ok(Ok(_)) => {
-                                        // succeeded
-                                    }
-                                    Err(_) => {
-                                        // timeout
-                                    }
-                                    Ok(Err(e)) => {
-                                        error!("receiving end of the channel is closed, will quit. err: {e}");
-                                        break;
-                                    }
-                                }
+                        unsafe { payload.set_len(size); }
+                        let msg = UdpMessage::Packet(UdpPacket{payload, local_addr, peer_addr: None});
+
+                        // Use try_send to avoid blocking recv loop
+                        match out_udp_sender.try_send(msg) {
+                            Ok(_) => {
+                                // succeeded
                             }
-                            Err(e) => {
-                                error!("failed to read from local udp socket, err: {e}");
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                warn!("outbound UDP channel is full, dropping packet from {local_addr}");
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                error!("receiving end of the channel is closed, will quit recv task");
+                                break;
                             }
                         }
                     }
-
-                    result = in_udp_receiver.recv() => {
-                        match result {
-                            Some(UdpMessage::Packet(p)) => {
-                                match udp_socket.send_to(&p.payload, p.local_addr).await {
-                                    Ok(_) => {
-                                        // succeeded
-                                    }
-                                    Err(e) => {
-                                        error!("failed to send packet to local, err: {e}");
-                                    }
-                                }
-                            }
-                            Some(UdpMessage::Quit) => {
-                                info!("udp server is requested to quit");
-                                break;
-                            }
-                            None => {
-                                // all senders quit
-                                info!("udp server quit");
-                                break;
-                            }
-                        }
+                    Err(e) => {
+                        error!("failed to read from local udp socket, err: {e}");
                     }
                 }
             }
+            info!("udp recv task quit: {addr}");
+        });
 
-            info!("udp server quit: {addr}");
+        // Spawn separate send task
+        tokio::spawn(async move {
+            loop {
+                match in_udp_receiver.recv().await {
+                    Some(UdpMessage::Packet(p)) => {
+                        match send_socket.send_to(&p.payload, p.local_addr).await {
+                            Ok(_) => {
+                                // succeeded
+                            }
+                            Err(e) => {
+                                error!("failed to send packet to local, err: {e}");
+                            }
+                        }
+                    }
+                    Some(UdpMessage::Quit) => {
+                        info!("udp send task is requested to quit");
+                        break;
+                    }
+                    None => {
+                        // all senders quit
+                        info!("udp send task quit");
+                        break;
+                    }
+                }
+            }
+            info!("udp send task quit: {addr}");
         });
 
         Ok(Self(state_clone))
