@@ -537,9 +537,9 @@ impl Client {
 
     async fn prepare_login_config(&self) -> Result<LoginConfig> {
         let mut transport_cfg = TransportConfig::default();
-        transport_cfg.stream_receive_window(quinn::VarInt::from_u32(1024 * 1024));
-        transport_cfg.receive_window(quinn::VarInt::from_u32(1024 * 1024 * 2));
-        transport_cfg.send_window(1024 * 1024 * 2);
+        transport_cfg.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024));
+        transport_cfg.receive_window(VarInt::from_u32(8 * 1024 * 1024));
+        transport_cfg.send_window(8 * 1024 * 1024);
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
         transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
 
