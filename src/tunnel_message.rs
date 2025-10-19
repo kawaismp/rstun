@@ -183,10 +183,10 @@ impl TunnelMessage {
     }
 
     /// Send a raw datagram payload with optional compression.
-    /// Data larger than 256 bytes is automatically compressed if compression reduces size.
+    /// Data larger than 2048 bytes is automatically compressed if compression reduces size.
     pub async fn send_raw(quic_send: &mut SendStream, data: &[u8]) -> Result<()> {
-        // Compress if worthwhile (min size: 256 bytes)
-        let (send_data, compressed) = compression::compress_if_worthwhile(data, 256)?;
+        // Compress if worthwhile (min size: 2048 bytes)
+        let (send_data, compressed) = compression::compress_if_worthwhile(data, 2048)?;
         
         // Write compression flag (1 byte)
         quic_send.write_u8(if compressed { 1 } else { 0 }).await?;
