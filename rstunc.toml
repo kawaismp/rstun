@@ -1,6 +1,6 @@
 # rstunc client configuration
+# Changes to [[tunnels]] are applied automatically while rstunc is running.
 server_address = "127.0.0.1:6060"
-client_id = "home-gateway"
 password = "change_this_password"
 workers = 0             # 0 = auto
 log_level = "info"

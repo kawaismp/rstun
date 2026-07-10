@@ -8,7 +8,7 @@ use crate::{
     QUIC_CONNECTION_WINDOW, QUIC_MAX_CONCURRENT_BIDI_STREAMS, QUIC_SEND_WINDOW,
     QUIC_STREAM_RECEIVE_WINDOW,
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::{bail, Context, Result};
 use backon::ExponentialBuilder;
 use backon::Retryable;
@@ -33,6 +33,8 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpStream;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 const DEFAULT_SERVER_PORT: u16 = 3515;
 const POST_TRAFFIC_DATA_INTERVAL_SECS: u64 = 30;
@@ -77,9 +79,16 @@ struct State {
     tcp_servers: AHashMap<SocketAddr, TcpServer>,
     udp_servers: AHashMap<SocketAddr, UdpServer>,
     endpoint: Option<Endpoint>,
-    connections: AHashMap<SocketAddr, Connection>,
+    connections: AHashMap<TunnelConfig, Connection>,
     client_state: ClientState,
     total_traffic_data: TunnelTraffic,
+    tunnel_tasks: AHashMap<TunnelConfig, ManagedTunnel>,
+    next_tunnel_index: usize,
+}
+
+struct ManagedTunnel {
+    cancel: watch::Sender<bool>,
+    task: JoinHandle<()>,
 }
 
 impl State {
@@ -91,6 +100,8 @@ impl State {
             connections: AHashMap::new(),
             client_state: ClientState::Idle,
             total_traffic_data: TunnelTraffic::default(),
+            tunnel_tasks: AHashMap::new(),
+            next_tunnel_index: 0,
         }
     }
 }
@@ -107,7 +118,6 @@ struct LoginConfig {
 pub struct Client {
     config: ClientConfig,
     inner_state: Arc<Mutex<State>>,
-    client_id: String,
 }
 
 macro_rules! inner_state {
@@ -118,21 +128,17 @@ macro_rules! inner_state {
 
 impl Client {
     /// Create a client with the given runtime configuration.
-    pub fn new(config: ClientConfig) -> Result<Self> {
+    pub fn new(config: ClientConfig) -> Self {
         INIT.call_once(|| {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .unwrap();
         });
 
-        LoginRequest::validate_client_id(&config.client_id)?;
-
-        let client_id = config.client_id.clone();
-        Ok(Client {
+        Client {
             config,
             inner_state: Arc::new(Mutex::new(State::new())),
-            client_id,
-        })
+        }
     }
 
     /// Start the runtime (multi-threaded tokio) and block the current thread until Ctrl-C.
@@ -154,19 +160,53 @@ impl Client {
         });
     }
 
+    /// Start tunneling and reconcile network tunnels received from a config watcher.
+    pub fn start_tunneling_with_updates(
+        &mut self,
+        mut updates: watch::Receiver<Vec<TunnelConfig>>,
+    ) {
+        let mut builder = if self.config.workers == 1 {
+            tokio::runtime::Builder::new_current_thread()
+        } else {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(self.config.workers);
+            builder
+        };
+
+        builder.enable_all().build().unwrap().block_on(async {
+            self.connect_and_serve_async();
+            let mut updates_open = true;
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    update = updates.changed(), if updates_open => {
+                        if update.is_err() {
+                            warn!("config watcher stopped; existing tunnels will keep running");
+                            updates_open = false;
+                            continue;
+                        }
+                        let tunnels = updates.borrow_and_update().clone();
+                        if let Err(error) = self.update_tunnels(tunnels).await {
+                            error!("rejected tunnel configuration update: {error:#}");
+                        } else {
+                            info!("tunnel configuration updated successfully");
+                        }
+                    }
+                }
+            }
+            self.stop_async().await;
+        });
+    }
+
     /// Spawn async tasks for network/channel-based tunnels; does not block.
     pub fn connect_and_serve_async(&mut self) {
-        for (index, tunnel_config) in self.config.tunnels.iter().cloned().enumerate() {
-            let mut this = self.clone();
-            tokio::spawn(async move {
-                this.connect_and_serve::<TcpStream>(
-                    index,
-                    Tunnel::NetworkBased(tunnel_config),
-                    None,
-                    None,
-                )
-                .await;
-            });
+        let tunnels = self.config.tunnels.clone();
+        if let Err(error) = Self::validate_tunnels(&tunnels) {
+            error!("invalid tunnel configuration: {error}");
+            return;
+        }
+        for tunnel_config in tunnels {
+            self.spawn_network_tunnel(tunnel_config);
         }
 
         self.report_traffic_data_in_background();
@@ -175,18 +215,118 @@ impl Client {
         }
     }
 
+    fn spawn_network_tunnel(&mut self, tunnel_config: TunnelConfig) {
+        let (cancel, cancel_rx) = watch::channel(false);
+        let index = {
+            let mut state = self.inner_state.lock();
+            let index = state.next_tunnel_index;
+            state.next_tunnel_index = state.next_tunnel_index.wrapping_add(1);
+            index
+        };
+        let mut this = self.clone();
+        let task_config = tunnel_config.clone();
+        let task = tokio::spawn(async move {
+            this.connect_and_serve::<TcpStream>(
+                index,
+                Tunnel::NetworkBased(task_config),
+                None,
+                None,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        let replaced = self
+            .inner_state
+            .lock()
+            .tunnel_tasks
+            .insert(tunnel_config, ManagedTunnel { cancel, task });
+        debug_assert!(replaced.is_none());
+    }
+
+    fn validate_tunnels(tunnels: &[TunnelConfig]) -> Result<()> {
+        let mut configs = AHashSet::new();
+        let mut ports = AHashSet::new();
+        for tunnel in tunnels {
+            if !configs.insert(tunnel.clone()) {
+                bail!("duplicate tunnel configuration: {tunnel:?}");
+            }
+            let addr = tunnel
+                .upstream
+                .upstream_addr
+                .context("inbound tunnel requires a server bind address")?;
+            if addr.port() == 0 {
+                bail!("inbound tunnel requires a non-zero server port");
+            }
+            if !ports.insert((tunnel.upstream.upstream_type, addr.port())) {
+                bail!(
+                    "multiple {} tunnels claim server port {}",
+                    tunnel.upstream.upstream_type,
+                    addr.port()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically reconcile running network tunnels with a new configuration.
+    /// Invalid updates leave the currently running tunnels unchanged.
+    pub async fn update_tunnels(&mut self, tunnels: Vec<TunnelConfig>) -> Result<()> {
+        Self::validate_tunnels(&tunnels)?;
+        let desired: AHashSet<_> = tunnels.iter().cloned().collect();
+
+        let removed = {
+            let mut state = self.inner_state.lock();
+            let removed_keys: Vec<_> = state
+                .tunnel_tasks
+                .keys()
+                .filter(|config| !desired.contains(*config))
+                .cloned()
+                .collect();
+            removed_keys
+                .into_iter()
+                .filter_map(|config| state.tunnel_tasks.remove(&config))
+                .collect::<Vec<_>>()
+        };
+
+        for tunnel in &removed {
+            tunnel.cancel.send(true).ok();
+        }
+        for tunnel in removed {
+            tunnel.task.await.ok();
+        }
+
+        let running: AHashSet<_> = self
+            .inner_state
+            .lock()
+            .tunnel_tasks
+            .keys()
+            .cloned()
+            .collect();
+        self.config.tunnels = tunnels.clone();
+        for tunnel in tunnels {
+            if !running.contains(&tunnel) {
+                self.spawn_network_tunnel(tunnel);
+            }
+        }
+        Ok(())
+    }
+
     /// Connect and serve a channel-based TCP tunnel using an external stream receiver.
     pub fn connect_and_serve_tcp_async<S: AsyncStream>(
         &mut self,
         stream_receiver: StreamReceiver<S>,
     ) {
         let mut this = self.clone();
+        let (cancel, cancel_rx) = watch::channel(false);
         tokio::spawn(async move {
+            let _cancel = cancel;
             this.connect_and_serve::<S>(
                 0,
                 Tunnel::ChannelBased(UpstreamType::Tcp),
                 Some(stream_receiver),
                 None,
+                cancel_rx,
             )
             .await;
         });
@@ -195,12 +335,15 @@ impl Client {
     /// Connect and serve a channel-based UDP tunnel using the provided sender/receiver.
     pub fn connect_and_serve_udp_async(&mut self, ch: (UdpSender, UdpReceiver)) {
         let mut this = self.clone();
+        let (cancel, cancel_rx) = watch::channel(false);
         tokio::spawn(async move {
+            let _cancel = cancel;
             this.connect_and_serve::<TcpStream>(
                 0,
                 Tunnel::ChannelBased(UpstreamType::Udp),
                 None,
                 Some(ch),
+                cancel_rx,
             )
             .await;
         });
@@ -291,6 +434,10 @@ impl Client {
 
         {
             let mut state = self.inner_state.lock();
+            for tunnel in state.tunnel_tasks.values() {
+                tunnel.cancel.send(true).ok();
+            }
+            state.tunnel_tasks.clear();
             for mut s in state.tcp_servers.values().cloned() {
                 tokio::spawn(async move {
                     s.shutdown().await.ok();
@@ -320,6 +467,21 @@ impl Client {
     #[allow(clippy::unnecessary_to_owned)]
     pub async fn stop_async(&self) {
         self.set_and_post_tunnel_state(ClientState::Stopping);
+
+        let tunnel_tasks = {
+            let mut state = self.inner_state.lock();
+            state
+                .tunnel_tasks
+                .drain()
+                .map(|(_, tunnel)| tunnel)
+                .collect::<Vec<_>>()
+        };
+        for tunnel in &tunnel_tasks {
+            tunnel.cancel.send(true).ok();
+        }
+        for tunnel in tunnel_tasks {
+            tunnel.task.await.ok();
+        }
 
         let mut tasks = tokio::task::JoinSet::new();
         {
@@ -355,16 +517,19 @@ impl Client {
         tunnel: Tunnel,
         mut stream_receiver: Option<StreamReceiver<S>>,
         mut ch: Option<(UdpSender, UdpReceiver)>,
+        mut cancel: watch::Receiver<bool>,
     ) {
         let login_request = LoginRequest {
             password: self.config.password.clone(),
-            client_id: self.client_id.clone(),
             tunnel: tunnel.clone(),
         };
 
         let mut pending_network_based_stream = None;
         let mut pending_channel_based_stream = None;
         loop {
+            if *cancel.borrow() || self.should_quit() {
+                break;
+            }
             let connect = || async {
                 let login_cfg = self.prepare_login_config().await?;
                 let endpoint = { self.inner_state.lock().endpoint.clone() };
@@ -390,7 +555,7 @@ impl Client {
 
                 Ok(conn)
             };
-            let result = connect
+            let retry = connect
                 .retry(
                     ExponentialBuilder::default()
                         .with_max_delay(Duration::from_secs(10))
@@ -400,28 +565,34 @@ impl Client {
                 .sleep(tokio::time::sleep)
                 .notify(|err: &anyhow::Error, dur: Duration| {
                     warn!("will retry after {dur:?}, err: {err:?}");
-                })
-                .await;
+                });
+            let result = tokio::select! {
+                _ = cancel.changed() => break,
+                result = retry => result,
+            };
 
-            if self.should_quit() {
+            if *cancel.borrow() || self.should_quit() {
                 break;
             }
 
             match result {
                 Ok(conn) => match &tunnel {
                     Tunnel::NetworkBased(tunnel_config) => {
-                        let local_server_addr = tunnel_config.local_server_addr;
-                        inner_state!(self, connections).insert(local_server_addr, conn.clone());
+                        inner_state!(self, connections).insert(tunnel_config.clone(), conn.clone());
 
-                        self.handle_network_based_tunnel(
-                            index,
-                            conn.clone(),
-                            tunnel_config,
-                            &mut pending_network_based_stream,
-                        )
-                        .await;
+                        tokio::select! {
+                            _ = cancel.changed() => {
+                                conn.close(VarInt::from_u32(5), b"tunnel removed");
+                            }
+                            _ = self.handle_network_based_tunnel(
+                                index,
+                                conn.clone(),
+                                tunnel_config,
+                                &mut pending_network_based_stream,
+                            ) => {}
+                        }
 
-                        inner_state!(self, connections).remove(&local_server_addr);
+                        inner_state!(self, connections).remove(tunnel_config);
                     }
                     Tunnel::ChannelBased(upstream_type) => match upstream_type {
                         UpstreamType::Tcp => {
@@ -435,14 +606,18 @@ impl Client {
                             self.set_and_post_tunnel_state(ClientState::Tunneling);
 
                             let stream_receiver = stream_receiver.as_mut().unwrap();
-                            TcpTunnel::start_serving(
-                                true,
-                                &conn,
-                                stream_receiver,
-                                &mut pending_channel_based_stream,
-                                self.config.tcp_timeout_ms,
-                            )
-                            .await;
+                            tokio::select! {
+                                _ = cancel.changed() => {
+                                    conn.close(VarInt::from_u32(5), b"tunnel removed");
+                                }
+                                _ = TcpTunnel::start_serving(
+                                    true,
+                                    &conn,
+                                    stream_receiver,
+                                    &mut pending_channel_based_stream,
+                                    self.config.tcp_timeout_ms,
+                                ) => {}
+                            }
                         }
 
                         UpstreamType::Udp => {
@@ -456,13 +631,17 @@ impl Client {
                             self.set_and_post_tunnel_state(ClientState::Tunneling);
 
                             let ch = ch.as_mut().unwrap();
-                            UdpTunnel::start_serving(
-                                &conn,
-                                &ch.0,
-                                &mut ch.1,
-                                self.config.udp_timeout_ms,
-                            )
-                            .await;
+                            tokio::select! {
+                                _ = cancel.changed() => {
+                                    conn.close(VarInt::from_u32(5), b"tunnel removed");
+                                }
+                                _ = UdpTunnel::start_serving(
+                                    &conn,
+                                    &ch.0,
+                                    &mut ch.1,
+                                    self.config.udp_timeout_ms,
+                                ) => {}
+                            }
                         }
                     },
                 },
@@ -477,7 +656,7 @@ impl Client {
                 }
             };
 
-            if self.should_quit() {
+            if *cancel.borrow() || self.should_quit() {
                 break;
             }
         }
@@ -595,20 +774,7 @@ impl Client {
                 .await
                 .context("login response timed out")??;
         match resp {
-            TunnelMessage::LoginResponse(LoginResponse::Accepted {
-                replaced_previous: false,
-            }) => {}
-            TunnelMessage::LoginResponse(LoginResponse::Accepted {
-                replaced_previous: true,
-            }) => {
-                self.post_tunnel_log(
-                    format!(
-                        "{index}:{} replaced its previous session",
-                        login_request.format_with_remote_addr(remote_addr)
-                    )
-                    .as_str(),
-                );
-            }
+            TunnelMessage::LoginResponse(LoginResponse::Accepted) => {}
             TunnelMessage::LoginResponse(LoginResponse::Rejected { reason }) => {
                 bail!(
                     "{index}:{} failed to login: {reason}",
@@ -982,9 +1148,8 @@ mod tests {
     use crate::{Server, ServerConfig, Upstream};
     use std::net::{Ipv4Addr, SocketAddr};
 
-    fn test_client_config(server_addr: SocketAddr, client_id: &str) -> ClientConfig {
+    fn test_client_config(server_addr: SocketAddr, tunnels: Vec<TunnelConfig>) -> ClientConfig {
         ClientConfig {
-            client_id: client_id.to_string(),
             cipher: "aes-128-gcm".to_string(),
             server_addr: server_addr.to_string(),
             password: "integration-secret".to_string(),
@@ -992,19 +1157,58 @@ mod tests {
             tcp_timeout_ms: 3_000,
             udp_timeout_ms: 3_000,
             workers: 1,
+            tunnels,
             ..ClientConfig::default()
         }
     }
 
-    async fn create_endpoint(client: &Client) -> Result<(Endpoint, SocketAddr, String)> {
-        let login_config = client.prepare_login_config().await?;
-        let mut endpoint = Endpoint::client(login_config.local_addr)?;
-        endpoint.set_default_client_config(login_config.quinn_client_cfg);
-        Ok((endpoint, login_config.remote_addr, login_config.domain))
+    async fn reserve_tcp_addr() -> SocketAddr {
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+                .await
+                .unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
     }
 
-    #[tokio::test]
-    async fn reconnect_replaces_same_client_and_rejects_competitor() {
+    async fn wait_until_tunnel_accepts(addr: SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wait_until_port_is_released(addr: SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpListener::bind(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn tunnel(bind: SocketAddr, destination_port: u16) -> TunnelConfig {
+        TunnelConfig {
+            upstream: Upstream {
+                upstream_addr: Some(bind),
+                upstream_type: UpstreamType::Tcp,
+            },
+            local_server_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), destination_port),
+        }
+    }
+
+    async fn start_test_server() -> (SocketAddr, JoinHandle<Result<()>>) {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let mut server = Server::new(ServerConfig {
             addr: "127.0.0.1:0".to_string(),
@@ -1016,76 +1220,104 @@ mod tests {
             udp_timeout_ms: 3_000,
             ..ServerConfig::default()
         });
-        let server_addr = server.bind().unwrap();
-        let server_task = tokio::spawn(async move { server.serve().await });
+        let addr = server.bind().unwrap();
+        let task = tokio::spawn(async move { server.serve().await });
+        (addr, task)
+    }
 
-        let probe = tokio::net::TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
-            .await
-            .unwrap();
-        let tunnel_addr = probe.local_addr().unwrap();
-        drop(probe);
+    async fn create_endpoint(client: &Client) -> Result<(Endpoint, SocketAddr, String)> {
+        let login_config = client.prepare_login_config().await?;
+        let mut endpoint = Endpoint::client(login_config.local_addr)?;
+        endpoint.set_default_client_config(login_config.quinn_client_cfg);
+        Ok((endpoint, login_config.remote_addr, login_config.domain))
+    }
 
-        let request_for = |client_id: &str| LoginRequest {
+    #[tokio::test]
+    async fn live_duplicate_is_rejected_without_disrupting_owner() {
+        let (server_addr, server_task) = start_test_server().await;
+        let tunnel_addr = reserve_tcp_addr().await;
+        let request = LoginRequest {
             password: "integration-secret".to_string(),
-            client_id: client_id.to_string(),
-            tunnel: Tunnel::NetworkBased(TunnelConfig {
-                upstream: Upstream {
-                    upstream_addr: Some(tunnel_addr),
-                    upstream_type: UpstreamType::Tcp,
-                },
-                local_server_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9),
-            }),
+            tunnel: Tunnel::NetworkBased(tunnel(tunnel_addr, 9)),
         };
 
-        let owner = Client::new(test_client_config(server_addr, "stable-owner")).unwrap();
+        let owner = Client::new(test_client_config(server_addr, vec![]));
         let (owner_endpoint, remote_addr, domain) = create_endpoint(&owner).await.unwrap();
         let first = owner
-            .login(
-                0,
-                &owner_endpoint,
-                &request_for("stable-owner"),
-                &remote_addr,
-                &domain,
-            )
-            .await
-            .unwrap();
-        let restarted_owner = Client::new(test_client_config(server_addr, "stable-owner")).unwrap();
-        let (restarted_endpoint, restarted_remote, restarted_domain) =
-            create_endpoint(&restarted_owner).await.unwrap();
-        let second = restarted_owner
-            .login(
-                0,
-                &restarted_endpoint,
-                &request_for("stable-owner"),
-                &restarted_remote,
-                &restarted_domain,
-            )
+            .login(0, &owner_endpoint, &request, &remote_addr, &domain)
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), first.closed())
-            .await
-            .expect("previous connection was not closed after replacement");
-
-        let competitor = Client::new(test_client_config(server_addr, "competitor")).unwrap();
+        let competitor = Client::new(test_client_config(server_addr, vec![]));
         let (competitor_endpoint, competitor_remote, competitor_domain) =
             create_endpoint(&competitor).await.unwrap();
         let rejected = competitor
             .login(
                 0,
                 &competitor_endpoint,
-                &request_for("competitor"),
+                &request,
                 &competitor_remote,
                 &competitor_domain,
             )
             .await;
         assert!(rejected.is_err());
-        assert!(second.close_reason().is_none());
+        assert!(first.close_reason().is_none());
 
-        second.close(VarInt::from_u32(0), b"test complete");
+        first.close(VarInt::from_u32(0), b"test complete");
         owner_endpoint.close(VarInt::from_u32(0), b"test complete");
-        restarted_endpoint.close(VarInt::from_u32(0), b"test complete");
         competitor_endpoint.close(VarInt::from_u32(0), b"test complete");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn reconciles_add_update_remove_and_rejects_invalid_updates() {
+        let (server_addr, server_task) = start_test_server().await;
+        let first_bind = reserve_tcp_addr().await;
+        let second_bind = reserve_tcp_addr().await;
+        let initial = tunnel(first_bind, 9);
+        let updated = tunnel(first_bind, 10);
+        let added = tunnel(second_bind, 11);
+
+        let mut client = Client::new(test_client_config(server_addr, vec![initial.clone()]));
+        client.connect_and_serve_async();
+        assert!(client
+            .inner_state
+            .lock()
+            .tunnel_tasks
+            .contains_key(&initial));
+        wait_until_tunnel_accepts(first_bind).await;
+
+        client.update_tunnels(vec![updated.clone()]).await.unwrap();
+        assert_eq!(client.inner_state.lock().tunnel_tasks.len(), 1);
+        assert!(client
+            .inner_state
+            .lock()
+            .tunnel_tasks
+            .contains_key(&updated));
+        wait_until_tunnel_accepts(first_bind).await;
+
+        client
+            .update_tunnels(vec![updated.clone(), added.clone()])
+            .await
+            .unwrap();
+        assert_eq!(client.inner_state.lock().tunnel_tasks.len(), 2);
+        wait_until_tunnel_accepts(first_bind).await;
+        wait_until_tunnel_accepts(second_bind).await;
+
+        let conflicting = tunnel(second_bind, 12);
+        assert!(client
+            .update_tunnels(vec![updated.clone(), added.clone(), conflicting])
+            .await
+            .is_err());
+        assert_eq!(client.inner_state.lock().tunnel_tasks.len(), 2);
+
+        client.update_tunnels(vec![added.clone()]).await.unwrap();
+        assert_eq!(client.inner_state.lock().tunnel_tasks.len(), 1);
+        assert!(client.inner_state.lock().tunnel_tasks.contains_key(&added));
+        wait_until_port_is_released(first_bind).await;
+        wait_until_tunnel_accepts(second_bind).await;
+
+        client.stop_async().await;
         server_task.abort();
     }
 }

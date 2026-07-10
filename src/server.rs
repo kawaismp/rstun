@@ -68,7 +68,6 @@ impl SessionListener {
 #[derive(Debug, Clone)]
 struct ConnectedSession {
     id: u64,
-    client_id: String,
     conn: Connection,
     listener: SessionListener,
 }
@@ -83,7 +82,6 @@ struct AuthenticatedTunnel {
 struct PreparedTunnel {
     tunnel_type: TunnelType,
     key: SessionKey,
-    preempted: bool,
     _key_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -317,11 +315,6 @@ impl Server {
         };
         info!("received login request: {remote_addr}");
 
-        if let Err(error) = crate::LoginRequest::validate_client_id(&login_request.client_id) {
-            TunnelMessage::send_rejection(&mut quic_send, error.to_string()).await?;
-            return Err(error);
-        }
-
         if let Err(error) =
             Self::check_password(config.password.as_str(), login_request.password.as_str())
         {
@@ -329,11 +322,9 @@ impl Server {
             return Err(error);
         }
 
-        let client_id = login_request.client_id;
         let prepared = match login_request.tunnel {
             Tunnel::NetworkBased(tunnel_config) => {
-                Self::derive_tunnel_type(conn.clone(), &tunnel_config, state.clone(), &client_id)
-                    .await
+                Self::derive_tunnel_type(conn.clone(), &tunnel_config, state.clone()).await
             }
             Tunnel::ChannelBased(_) => {
                 Err(anyhow::anyhow!("only network-based tunneling is supported"))
@@ -359,7 +350,6 @@ impl Server {
                 prepared.key,
                 ConnectedSession {
                     id: session_id,
-                    client_id,
                     conn: conn.clone(),
                     listener: listener.clone(),
                 },
@@ -368,9 +358,7 @@ impl Server {
             session_id
         };
 
-        let response = TunnelMessage::LoginResponse(LoginResponse::Accepted {
-            replaced_previous: prepared.preempted,
-        });
+        let response = TunnelMessage::LoginResponse(LoginResponse::Accepted);
         if let Err(error) = TunnelMessage::send(&mut quic_send, &response).await {
             Self::remove_session_if_id(&state, prepared.key, session_id);
             conn.close(quinn::VarInt::from_u32(4), b"login response failed");
@@ -390,7 +378,6 @@ impl Server {
         conn: quinn::Connection,
         tunnel_config: &TunnelConfig,
         state: Arc<Mutex<State>>,
-        client_id: &str,
     ) -> Result<PreparedTunnel> {
         let upstream_addr = tunnel_config.upstream.upstream_addr.ok_or_else(|| {
             anyhow::anyhow!("explicit port is required to start inbound tunneling")
@@ -411,11 +398,9 @@ impl Server {
         let key_guard = key_lock.lock_owned().await;
         let incumbent = { state.lock().sessions.get(&key).cloned() };
 
-        let mut preempted = false;
         if let Some(incumbent) = incumbent {
-            let reconnecting_owner = client_id == incumbent.client_id;
             let connection_closed = incumbent.conn.close_reason().is_some();
-            if !reconnecting_owner && !connection_closed {
+            if !connection_closed {
                 log_and_bail!(
                     "{} port {} is owned by an active client",
                     key.upstream_type,
@@ -426,9 +411,8 @@ impl Server {
             Self::remove_session_if_id(&state, key, incumbent.id);
             incumbent
                 .conn
-                .close(quinn::VarInt::from_u32(2), b"replaced by reconnect");
+                .close(quinn::VarInt::from_u32(2), b"replacing closed session");
             incumbent.listener.shutdown().await;
-            preempted = true;
         }
 
         let tunnel_type = match tunnel_config.upstream.upstream_type {
@@ -460,7 +444,6 @@ impl Server {
         Ok(PreparedTunnel {
             tunnel_type,
             key,
-            preempted,
             _key_guard: key_guard,
         })
     }

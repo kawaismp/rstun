@@ -79,7 +79,6 @@ udp_idle_ms = 30000
 ```toml
 # rstunc client configuration
 server_address = "127.0.0.1:6060"
-client_id = "home-gateway"
 password = "super_secure_pa$$word"
 workers = 4
 log_level = "info"
@@ -122,7 +121,6 @@ rstund --addr 0.0.0.0:6060 --password 123456
 #### Start the client
 ```sh
 rstunc --server-addr 1.2.3.4:6060 --password 123456 \
-  --client-id home-gateway \
   --tcp-mappings "127.0.0.1:8080^9000" \
   --udp-mappings "0.0.0.0:25565^25565" \
   --hop-interval-ms 30000
@@ -143,7 +141,6 @@ rstunc --server-addr 1.2.3.4:6060 --password 123456 \
 ```
   --config <FILE>                  Path to TOML configuration file
   -a, --server-addr <ADDR>         Server address (<domain:ip>[:port])
-      --client-id <ID>             Stable logical client identifier
   -p, --password <PASSWORD>        Password for server authentication
   -t, --tcp-mappings <MAPPINGS>    Comma-separated TCP tunnel mappings
   -u, --udp-mappings <MAPPINGS>    Comma-separated UDP tunnel mappings
@@ -169,6 +166,23 @@ The client supports optional connection migration via the `--hop-interval-ms` pa
 - If `--hop-interval-ms` is not specified, connection migration is disabled
 - Recommended intervals range from 60 to 600 seconds depending on network conditions
 - Shorter intervals provide more frequent migration but may cause brief latency spikes
+
+---
+
+## Tunnel Hot Reload
+
+When `rstunc` is started from a TOML configuration file, it watches the file for tunnel changes.
+Changes to `[[tunnels]]` are reconciled without restarting the process:
+
+- unchanged tunnels remain connected;
+- removed tunnels are shut down cleanly;
+- changed tunnels release the old server port before reconnecting;
+- new tunnels are started automatically;
+- invalid updates are rejected atomically and the last valid tunnel set keeps running.
+
+The watcher checks for changes every 500 ms. Hot reload manages tunnel entries only; changes to
+authentication, TLS, DNS, worker, or timeout settings require a process restart. Supplying tunnel
+mappings through CLI flags makes the CLI authoritative and disables TOML tunnel hot reload.
 
 ---
 

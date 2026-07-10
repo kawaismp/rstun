@@ -166,7 +166,7 @@ impl Display for UpstreamType {
 }
 
 /// Upstream endpoint definition.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Upstream {
     /// Destination address on the peer side (None means use server default in OUT mode).
     pub upstream_addr: Option<SocketAddr>,
@@ -184,7 +184,7 @@ impl Display for Upstream {
 }
 
 /// A single tunnel specification.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TunnelConfig {
     pub upstream: Upstream,
     pub local_server_addr: SocketAddr,
@@ -201,8 +201,6 @@ pub(crate) enum Tunnel {
 /// Client-side runtime configuration.
 #[derive(Debug, Default, Clone)]
 pub struct ClientConfig {
-    /// Stable identifier for this logical client across process restarts.
-    pub client_id: String,
     /// Path to a PEM certificate for server identity (self-signed use-case).
     pub cert_path: String,
     /// Preferred TLS cipher suite string (see SUPPORTED_CIPHER_SUITE_STRS).
@@ -265,7 +263,6 @@ impl ClientConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         server_addr: &str,
-        client_id: &str,
         password: &str,
         cert: &str,
         cipher: &str,
@@ -280,11 +277,6 @@ impl ClientConfig {
         mut udp_timeout_ms: u64,
         mut hop_interval_ms: u64,
     ) -> Result<ClientConfig> {
-        if tcp_addr_mappings.is_empty() && udp_addr_mappings.is_empty() {
-            log_and_bail!("must specify either --tcp-mappings or --udp-mappings, or both");
-        }
-        LoginRequest::validate_client_id(client_id)?;
-
         if quic_timeout_ms == 0 {
             quic_timeout_ms = 30000;
         }
@@ -301,7 +293,6 @@ impl ClientConfig {
         }
 
         let mut config = ClientConfig {
-            client_id: client_id.to_string(),
             cert_path: cert.to_string(),
             cipher: cipher.to_string(),
             server_addr: if !server_addr.contains(':') {

@@ -15,7 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_UDP_BATCH_BYTES: usize = 128 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_CLIENT_ID_BYTES: usize = 128;
 
 fn validate_control_message_len(len: usize) -> Result<()> {
     if len > MAX_CONTROL_MESSAGE_BYTES {
@@ -37,27 +36,16 @@ pub enum TunnelMessage {
 /// Login payload containing authentication, ownership, and tunnel details.
 pub(crate) struct LoginRequest {
     pub password: String,
-    pub client_id: String,
     pub tunnel: Tunnel,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoginResponse {
-    Accepted { replaced_previous: bool },
+    Accepted,
     Rejected { reason: String },
 }
 
 impl LoginRequest {
-    pub fn validate_client_id(client_id: &str) -> Result<()> {
-        if client_id.trim().is_empty() {
-            bail!("client_id must not be empty");
-        }
-        if client_id.len() > MAX_CLIENT_ID_BYTES {
-            bail!("client_id must not exceed {MAX_CLIENT_ID_BYTES} bytes");
-        }
-        Ok(())
-    }
-
     /// Format a human-friendly description including the remote address.
     pub fn format_with_remote_addr(&self, remote_addr: &SocketAddr) -> String {
         match &self.tunnel {
@@ -102,12 +90,7 @@ impl Display for TunnelMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Login(request) => f.write_str(request.to_string().as_str()),
-            Self::LoginResponse(LoginResponse::Accepted {
-                replaced_previous: false,
-            }) => f.write_str("accepted"),
-            Self::LoginResponse(LoginResponse::Accepted {
-                replaced_previous: true,
-            }) => f.write_str("accepted (replaced previous session)"),
+            Self::LoginResponse(LoginResponse::Accepted) => f.write_str("accepted"),
             Self::LoginResponse(LoginResponse::Rejected { reason }) => {
                 write!(f, "rejected: {reason}")
             }
@@ -317,7 +300,6 @@ mod tests {
     fn login_protocol_round_trips() {
         let login_request = LoginRequest {
             password: "secret".to_string(),
-            client_id: "home-gateway".to_string(),
             tunnel: Tunnel::NetworkBased(TunnelConfig {
                 upstream: Upstream {
                     upstream_addr: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080)),
@@ -329,18 +311,14 @@ mod tests {
         let encoded = postcard::to_allocvec(&TunnelMessage::Login(login_request)).unwrap();
 
         match postcard::from_bytes::<TunnelMessage>(&encoded).unwrap() {
-            TunnelMessage::Login(request) => assert_eq!(request.client_id, "home-gateway"),
+            TunnelMessage::Login(request) => assert_eq!(request.password, "secret"),
             message => panic!("unexpected decoded message: {message:?}"),
         }
 
-        let response = TunnelMessage::LoginResponse(LoginResponse::Accepted {
-            replaced_previous: true,
-        });
+        let response = TunnelMessage::LoginResponse(LoginResponse::Accepted);
         let encoded = postcard::to_allocvec(&response).unwrap();
         match postcard::from_bytes::<TunnelMessage>(&encoded).unwrap() {
-            TunnelMessage::LoginResponse(LoginResponse::Accepted { replaced_previous }) => {
-                assert!(replaced_previous)
-            }
+            TunnelMessage::LoginResponse(LoginResponse::Accepted) => {}
             message => panic!("unexpected decoded message: {message:?}"),
         }
     }
@@ -349,12 +327,5 @@ mod tests {
     fn rejects_oversized_control_messages_before_allocation() {
         assert!(validate_control_message_len(MAX_CONTROL_MESSAGE_BYTES).is_ok());
         assert!(validate_control_message_len(MAX_CONTROL_MESSAGE_BYTES + 1).is_err());
-    }
-
-    #[test]
-    fn validates_client_identifiers() {
-        assert!(LoginRequest::validate_client_id("home-gateway").is_ok());
-        assert!(LoginRequest::validate_client_id("  ").is_err());
-        assert!(LoginRequest::validate_client_id(&"x".repeat(129)).is_err());
     }
 }

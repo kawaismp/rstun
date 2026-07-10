@@ -6,11 +6,15 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use anyhow::{bail, Context, Result};
 use clap::builder::PossibleValuesParser;
 use clap::builder::TypedValueParser as _;
 use clap::Parser;
-use log::error;
+use log::{error, warn};
 use rstun::*;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+use tokio::sync::watch;
 
 #[derive(serde::Deserialize)]
 struct TomlTunnel {
@@ -42,7 +46,6 @@ struct DnsToml {
 #[derive(serde::Deserialize)]
 struct RstuncToml {
     server_address: Option<String>,
-    client_id: Option<String>,
     password: Option<String>,
     workers: Option<usize>,
     log_level: Option<String>,
@@ -56,14 +59,93 @@ struct RstuncToml {
     tunnels: Option<Vec<TomlTunnel>>,
 }
 
+fn parse_tunnel_addr(value: &str) -> Result<SocketAddr> {
+    if let Ok(port) = value.parse::<u16>() {
+        return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    }
+    value
+        .parse()
+        .with_context(|| format!("invalid tunnel address '{value}'"))
+}
+
+fn parse_toml_tunnels(tunnels: Option<Vec<TomlTunnel>>) -> Result<Vec<TunnelConfig>> {
+    tunnels
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tunnel| {
+            let name = tunnel.name.unwrap_or_else(|| "unnamed tunnel".to_string());
+            let upstream_type = match tunnel.protocol.to_ascii_lowercase().as_str() {
+                "tcp" => UpstreamType::Tcp,
+                "udp" => UpstreamType::Udp,
+                _ => bail!("tunnel '{name}' protocol must be 'tcp' or 'udp'"),
+            };
+            Ok(TunnelConfig {
+                upstream: Upstream {
+                    upstream_addr: Some(parse_tunnel_addr(&tunnel.bind)?),
+                    upstream_type,
+                },
+                local_server_addr: parse_tunnel_addr(&tunnel.destination)?,
+            })
+        })
+        .collect()
+}
+
+fn spawn_config_watcher(
+    path: String,
+    initial_content: String,
+    initial_tunnels: Vec<TunnelConfig>,
+) -> watch::Receiver<Vec<TunnelConfig>> {
+    let (updates, receiver) = watch::channel(initial_tunnels);
+    std::thread::spawn(move || {
+        let mut last_content = initial_content;
+        let mut last_read_error = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if updates.is_closed() {
+                break;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) => {
+                    let message = error.to_string();
+                    if last_read_error.as_deref() != Some(message.as_str()) {
+                        warn!("failed to read config update from {path}: {message}");
+                        last_read_error = Some(message);
+                    }
+                    continue;
+                }
+            };
+            last_read_error = None;
+            if content == last_content {
+                continue;
+            }
+            last_content = content.clone();
+
+            let tunnels = toml::from_str::<RstuncToml>(&content)
+                .context("failed to parse updated TOML")
+                .and_then(|config| parse_toml_tunnels(config.tunnels));
+            match tunnels {
+                Ok(tunnels) => {
+                    if updates.send(tunnels).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => warn!("ignored invalid config update: {error:#}"),
+            }
+        }
+    });
+    receiver
+}
+
 fn main() {
     let mut args = RstuncArgs::parse();
+    let cli_tunnels_supplied = !args.tcp_mappings.is_empty() || !args.udp_mappings.is_empty();
+    let mut watched_content = None;
 
     if args.config.is_empty() {
         if !std::path::Path::new("rstunc.toml").exists() {
             let default_config = r#"# rstunc client configuration
 server_address = "127.0.0.1:6060"
-client_id = "home-gateway"
 password = "change_this_password"
 workers = 0             # 0 = auto
 log_level = "info"
@@ -99,6 +181,7 @@ destination = "9000"
             println!("failed to read config {}: {e}", args.config);
             std::process::exit(1);
         });
+        watched_content = Some(content.clone());
         let toml: RstuncToml = toml::from_str(&content).unwrap_or_else(|e| {
             println!("failed to parse TOML config {}: {e}", args.config);
             std::process::exit(1);
@@ -107,11 +190,6 @@ destination = "9000"
         if let Some(v) = toml.server_address {
             if args.server_addr.is_empty() {
                 args.server_addr = v;
-            }
-        }
-        if let Some(v) = toml.client_id {
-            if args.client_id.is_empty() {
-                args.client_id = v;
             }
         }
         if let Some(v) = toml.password {
@@ -192,24 +270,23 @@ destination = "9000"
             }
         }
 
-        if let Some(tunnels) = toml.tunnels {
+        if toml.tunnels.is_some() && !cli_tunnels_supplied {
             let mut tcp_mappings = Vec::new();
             let mut udp_mappings = Vec::new();
 
-            for t in tunnels {
-                let name = t.name.unwrap_or_else(|| "unnamed tunnel".into());
-                let mapping = format!("{}^{}", t.bind, t.destination);
-
-                match t.protocol.to_lowercase().as_str() {
-                    "tcp" => tcp_mappings.push(mapping),
-                    "udp" => udp_mappings.push(mapping),
-                    _ => {
-                        println!(
-                            "Error in tunnel '{}': protocol must be 'tcp' or 'udp'",
-                            name
-                        );
-                        std::process::exit(1);
-                    }
+            let tunnels = parse_toml_tunnels(toml.tunnels).unwrap_or_else(|error| {
+                println!("invalid tunnel configuration: {error:#}");
+                std::process::exit(1);
+            });
+            for tunnel in tunnels {
+                let mapping = format!(
+                    "{}^{}",
+                    tunnel.upstream.upstream_addr.unwrap(),
+                    tunnel.local_server_addr
+                );
+                match tunnel.upstream.upstream_type {
+                    UpstreamType::Tcp => tcp_mappings.push(mapping),
+                    UpstreamType::Udp => udp_mappings.push(mapping),
                 }
             }
 
@@ -222,8 +299,8 @@ destination = "9000"
         }
     }
 
-    if args.server_addr.is_empty() || args.client_id.is_empty() || args.password.is_empty() {
-        println!("server_addr, client_id, and password are required (via CLI or TOML config)");
+    if args.server_addr.is_empty() || args.password.is_empty() {
+        println!("server_addr and password are required (via CLI or TOML config)");
         std::process::exit(1);
     }
 
@@ -232,7 +309,6 @@ destination = "9000"
 
     let config = ClientConfig::create(
         &args.server_addr,
-        &args.client_id,
         &args.password,
         &args.cert,
         &args.cipher,
@@ -252,9 +328,15 @@ destination = "9000"
     });
 
     if let Ok(config) = config {
-        match Client::new(config) {
-            Ok(mut client) => client.start_tunneling(),
-            Err(error) => error!("{error}"),
+        let initial_tunnels = config.tunnels.clone();
+        let mut client = Client::new(config);
+        if cli_tunnels_supplied {
+            client.start_tunneling();
+        } else if let Some(content) = watched_content {
+            let updates = spawn_config_watcher(args.config, content, initial_tunnels);
+            client.start_tunneling_with_updates(updates);
+        } else {
+            client.start_tunneling();
         }
     }
 }
@@ -269,10 +351,6 @@ struct RstuncArgs {
     /// Server address (<domain:ip>[:port]) of rstund. Default port is 3515.
     #[arg(short = 'a', long, default_value = "")]
     server_addr: String,
-
-    /// Stable identifier for this logical client across process restarts.
-    #[arg(long, default_value = "")]
-    client_id: String,
 
     /// Password for server authentication (must match server's password)
     #[arg(short = 'p', long, default_value = "")]
@@ -339,4 +417,77 @@ struct RstuncArgs {
             _ => "info",
         }.to_string()))]
     loglevel: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_tunnels(tunnels: &str) -> String {
+        format!(
+            r#"server_address = "127.0.0.1:6060"
+password = "secret"
+{tunnels}
+"#
+        )
+    }
+
+    #[test]
+    fn parses_toml_tunnels_with_canonical_direction() {
+        let content = config_with_tunnels(
+            r#"[[tunnels]]
+protocol = "tcp"
+bind = "0.0.0.0:9000"
+destination = "127.0.0.1:8080""#,
+        );
+        let config: RstuncToml = toml::from_str(&content).unwrap();
+        let tunnels = parse_toml_tunnels(config.tunnels).unwrap();
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(
+            tunnels[0].upstream.upstream_addr.unwrap().to_string(),
+            "0.0.0.0:9000"
+        );
+        assert_eq!(tunnels[0].local_server_addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_invalid_content_and_emits_next_valid_update() {
+        let path = std::env::temp_dir().join(format!(
+            "rstunc-hot-reload-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let initial = config_with_tunnels("");
+        std::fs::write(&path, &initial).unwrap();
+        let mut updates =
+            spawn_config_watcher(path.to_string_lossy().into_owned(), initial, vec![]);
+
+        std::fs::write(&path, "not valid toml = [").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), updates.changed())
+                .await
+                .is_err()
+        );
+
+        let valid = config_with_tunnels(
+            r#"[[tunnels]]
+protocol = "udp"
+bind = "127.0.0.1:9100"
+destination = "127.0.0.1:8100""#,
+        );
+        std::fs::write(&path, valid).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), updates.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let update = updates.borrow_and_update().clone();
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].upstream.upstream_type, UpstreamType::Udp);
+
+        drop(updates);
+        std::fs::remove_file(path).unwrap();
+    }
 }
