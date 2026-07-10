@@ -380,6 +380,27 @@ pub fn socket_addr_with_unspecified_ip_port(ipv6: bool) -> SocketAddr {
     }
 }
 
+/// Wait for a process shutdown request (Ctrl+C, or SIGTERM on Unix).
+pub async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("failed to install Ctrl+C handler")?,
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to install Ctrl+C handler")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_addr_mappings, TunnelConfig, UpstreamType};

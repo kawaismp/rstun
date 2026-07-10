@@ -106,7 +106,7 @@ impl State {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// QUIC-based tunnel server. Binds to an address, authenticates clients, and
 /// serves TCP/UDP tunnels as negotiated.
 pub struct Server {
@@ -211,7 +211,9 @@ impl Server {
     }
 
     pub async fn serve(&self) -> Result<()> {
-        let endpoint = inner_state!(self, endpoint).take().context("failed")?;
+        let endpoint = inner_state!(self, endpoint)
+            .clone()
+            .context("server is not bound")?;
         while let Some(client_conn) = endpoint.accept().await {
             let state = self.inner_state.clone();
             let config = inner_state!(self, config).clone();
@@ -231,6 +233,42 @@ impl Server {
         info!("quit!");
 
         Ok(())
+    }
+
+    /// Gracefully stop accepting connections, close active sessions, and drain QUIC.
+    pub async fn shutdown(&self) {
+        let (endpoint, sessions) = {
+            let mut state = self.inner_state.lock();
+            (
+                state.endpoint.take(),
+                state
+                    .sessions
+                    .drain()
+                    .map(|(_, session)| session)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        if let Some(endpoint) = &endpoint {
+            endpoint.close(quinn::VarInt::from_u32(1), b"server shutting down");
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for session in sessions {
+            session
+                .conn
+                .close(quinn::VarInt::from_u32(1), b"server shutting down");
+            tasks.spawn(async move {
+                session.listener.shutdown().await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        if let Some(endpoint) = endpoint {
+            tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle())
+                .await
+                .ok();
+        }
     }
 
     async fn serve_connection(
@@ -518,8 +556,8 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionKey;
-    use crate::UpstreamType;
+    use super::{Server, SessionKey};
+    use crate::{ServerConfig, UpstreamType};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
@@ -535,5 +573,29 @@ mod tests {
             SessionKey::new(UpstreamType::Tcp, ipv4),
             SessionKey::new(UpstreamType::Tcp, ipv6)
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_stops_server_without_idle_timeout() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mut server = Server::new(ServerConfig {
+            addr: "127.0.0.1:0".to_string(),
+            password: "test".to_string(),
+            cert_path: format!("{manifest_dir}/localhost.crt.pem"),
+            key_path: format!("{manifest_dir}/localhost.key.pem"),
+            quic_timeout_ms: 30_000,
+            ..ServerConfig::default()
+        });
+        server.bind().unwrap();
+        let serving = server.clone();
+        let task = tokio::spawn(async move { serving.serve().await });
+
+        tokio::task::yield_now().await;
+        server.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("server shutdown waited for idle timeout")
+            .unwrap()
+            .unwrap();
     }
 }

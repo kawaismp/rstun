@@ -193,6 +193,7 @@ mappings through CLI flags makes the CLI authoritative and disables TOML tunnel 
 - **Self-signed certificates**: If no certificate is provided, a self-signed certificate for `localhost` is generated (for testing only).
 - **Security**: For production, always use a valid certificate and connect via domain name.
 - **Connection migration**: Use `--hop-interval-ms` to enable periodic port migration for improved performance in environments with UDP throttling.
+- **Graceful shutdown**: Ctrl+C and SIGTERM close active QUIC sessions and drain the endpoint, allowing an immediate restart without waiting for the idle timeout.
 
 ---
 

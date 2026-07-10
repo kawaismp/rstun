@@ -196,7 +196,14 @@ async fn run(mut args: RstundArgs) -> Result<()> {
 
     let mut server = Server::new(config);
     server.bind()?;
-    server.serve().await?;
+    tokio::select! {
+        result = server.serve() => result?,
+        signal = wait_for_shutdown_signal() => {
+            signal?;
+            info!("shutdown requested; closing tunnel sessions");
+            server.shutdown().await;
+        }
+    }
     Ok(())
 }
 

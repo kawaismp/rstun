@@ -155,7 +155,9 @@ impl Client {
 
         builder.enable_all().build().unwrap().block_on(async {
             self.connect_and_serve_async();
-            let _ = tokio::signal::ctrl_c().await;
+            if let Err(error) = crate::wait_for_shutdown_signal().await {
+                error!("shutdown signal handler failed: {error:#}");
+            }
             self.stop_async().await;
         });
     }
@@ -176,9 +178,16 @@ impl Client {
         builder.enable_all().build().unwrap().block_on(async {
             self.connect_and_serve_async();
             let mut updates_open = true;
+            let shutdown = crate::wait_for_shutdown_signal();
+            tokio::pin!(shutdown);
             loop {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
+                    result = &mut shutdown => {
+                        if let Err(error) = result {
+                            error!("shutdown signal handler failed: {error:#}");
+                        }
+                        break;
+                    }
                     update = updates.changed(), if updates_open => {
                         if update.is_err() {
                             warn!("config watcher stopped; existing tunnels will keep running");
@@ -458,6 +467,9 @@ impl Client {
             state.tcp_servers.clear();
             state.udp_servers.clear();
             state.connections.clear();
+            if let Some(endpoint) = state.endpoint.take() {
+                endpoint.close(VarInt::from_u32(1), b"client shutting down");
+            }
         }
 
         std::thread::sleep(Duration::from_secs(3));
@@ -483,32 +495,54 @@ impl Client {
             tunnel.task.await.ok();
         }
 
-        let mut tasks = tokio::task::JoinSet::new();
-        {
+        let (tcp_servers, udp_servers, connections, endpoint) = {
             let mut state = self.inner_state.lock();
-            for mut s in state.tcp_servers.values().cloned() {
-                tasks.spawn(async move {
-                    s.shutdown().await.ok();
-                });
-            }
-            for mut s in state.udp_servers.values().cloned() {
-                tasks.spawn(async move {
-                    s.shutdown().await.ok();
-                });
-            }
+            (
+                state
+                    .tcp_servers
+                    .drain()
+                    .map(|(_, server)| server)
+                    .collect::<Vec<_>>(),
+                state
+                    .udp_servers
+                    .drain()
+                    .map(|(_, server)| server)
+                    .collect::<Vec<_>>(),
+                state
+                    .connections
+                    .drain()
+                    .map(|(_, conn)| conn)
+                    .collect::<Vec<_>>(),
+                state.endpoint.take(),
+            )
+        };
 
-            for c in state.connections.values().cloned() {
-                tasks.spawn(async move {
-                    c.close(VarInt::from_u32(1), b"");
-                });
-            }
+        for connection in connections {
+            connection.close(VarInt::from_u32(1), b"client shutting down");
+        }
+        if let Some(endpoint) = &endpoint {
+            endpoint.close(VarInt::from_u32(1), b"client shutting down");
+        }
 
-            state.tcp_servers.clear();
-            state.udp_servers.clear();
-            state.connections.clear();
+        let mut tasks = tokio::task::JoinSet::new();
+        for mut server in tcp_servers {
+            tasks.spawn(async move {
+                server.shutdown().await.ok();
+            });
+        }
+        for mut server in udp_servers {
+            tasks.spawn(async move {
+                server.shutdown().await.ok();
+            });
         }
 
         while tasks.join_next().await.is_some() {}
+        if let Some(endpoint) = endpoint {
+            tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle())
+                .await
+                .ok();
+        }
+        self.set_and_post_tunnel_state(ClientState::Terminated);
     }
 
     async fn connect_and_serve<S: AsyncStream>(
@@ -1318,6 +1352,35 @@ mod tests {
         wait_until_tunnel_accepts(second_bind).await;
 
         client.stop_async().await;
+
+        let restarted = Client::new(test_client_config(server_addr, vec![]));
+        let (restart_endpoint, restart_remote, restart_domain) =
+            create_endpoint(&restarted).await.unwrap();
+        let restart_request = LoginRequest {
+            password: "integration-secret".to_string(),
+            tunnel: Tunnel::NetworkBased(added),
+        };
+        let restarted_connection = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(connection) = restarted
+                    .login(
+                        0,
+                        &restart_endpoint,
+                        &restart_request,
+                        &restart_remote,
+                        &restart_domain,
+                    )
+                    .await
+                {
+                    break connection;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("clean restart waited for the QUIC idle timeout");
+        restarted_connection.close(VarInt::from_u32(0), b"test complete");
+        restart_endpoint.close(VarInt::from_u32(0), b"test complete");
         server_task.abort();
     }
 }
