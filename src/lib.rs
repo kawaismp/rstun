@@ -33,7 +33,7 @@ use std::net::Ipv6Addr;
 use std::{net::SocketAddr, ops::Deref, sync::LazyLock};
 pub use tcp::tcp_server::TcpServer;
 pub use tcp::{AsyncStream, StreamMessage, StreamReceiver, StreamRequest, StreamSender};
-use tunnel_message::LoginInfo;
+use tunnel_message::LoginRequest;
 use udp::udp_server::UdpServer;
 pub use udp::{UdpMessage, UdpPacket, UdpReceiver, UdpSender};
 
@@ -150,7 +150,7 @@ pub enum TunnelType {
 }
 
 /// Transport type for a tunnel: TCP or UDP.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UpstreamType {
     Tcp,
     Udp,
@@ -201,6 +201,8 @@ pub(crate) enum Tunnel {
 /// Client-side runtime configuration.
 #[derive(Debug, Default, Clone)]
 pub struct ClientConfig {
+    /// Stable identifier for this logical client across process restarts.
+    pub client_id: String,
     /// Path to a PEM certificate for server identity (self-signed use-case).
     pub cert_path: String,
     /// Preferred TLS cipher suite string (see SUPPORTED_CIPHER_SUITE_STRS).
@@ -256,14 +258,14 @@ pub struct ServerConfig {
 impl ClientConfig {
     /// Create a ClientConfig by parsing CLI-style mapping strings.
     ///
-    /// - tcp_addr_mappings / udp_addr_mappings: comma-separated entries in the form
-    ///   MODE^SRC^DEST where MODE is IN|OUT, SRC is [ip:]port, DEST is [ip:]port or ANY
-    ///   (ANY means use peer default, only valid in OUT mode).
+    /// - tcp_addr_mappings / udp_addr_mappings: comma-separated inbound tunnel
+    ///   entries in the form BIND^DESTINATION, where each address is [ip:]port.
     /// - dot / dns: comma-separated servers.
     /// - workers: set to 0 to use all logical CPUs.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         server_addr: &str,
+        client_id: &str,
         password: &str,
         cert: &str,
         cipher: &str,
@@ -281,6 +283,7 @@ impl ClientConfig {
         if tcp_addr_mappings.is_empty() && udp_addr_mappings.is_empty() {
             log_and_bail!("must specify either --tcp-mappings or --udp-mappings, or both");
         }
+        LoginRequest::validate_client_id(client_id)?;
 
         if quic_timeout_ms == 0 {
             quic_timeout_ms = 30000;
@@ -298,6 +301,7 @@ impl ClientConfig {
         }
 
         let mut config = ClientConfig {
+            client_id: client_id.to_string(),
             cert_path: cert.to_string(),
             cipher: cipher.to_string(),
             server_addr: if !server_addr.contains(':') {
@@ -341,50 +345,33 @@ fn parse_addr_mappings(
 
     for mapping in mappings.split(',') {
         let parts: Vec<&str> = mapping.split('^').collect();
-        if parts.len() < 2 || parts.len() > 3 {
-            log_and_bail!("Invalid mapping format, expected bind^dest (or IN^bind^dest)");
+        if parts.len() != 2 {
+            log_and_bail!("invalid mapping format, expected bind^destination");
         }
 
-        let parse_addr = |addr: &str| -> Result<Option<SocketAddr>> {
-            if addr == "ANY" {
-                return Ok(None);
-            }
-
+        let parse_addr = |addr: &str| -> Result<SocketAddr> {
             // Handle port-only case
             let port = addr.parse::<u16>();
             if let Ok(port) = port {
-                return Ok(Some(SocketAddr::new(
+                return Ok(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                     port,
-                )));
+                ));
             }
 
             // Parse full SocketAddr
-            Ok(Some(addr.parse().with_context(|| {
+            addr.parse().with_context(|| {
                 format!("Invalid address format '{addr}', expected IP:PORT or PORT")
-            })?))
+            })
         };
 
-        let (bind_str, dest_str) = if parts.len() == 3 && parts[0].eq_ignore_ascii_case("IN") {
-            (parts[1], parts[2])
-        } else if parts.len() == 2 {
-            (parts[0], parts[1])
-        } else {
-            log_and_bail!("Invalid mapping format, expected bind^dest (or IN^bind^dest)");
-        };
-
-        let local_server_addr = parse_addr(bind_str)?;
-        if local_server_addr.is_none() {
-            log_and_bail!("'ANY' is not allowed as bind address");
-        }
-        let local_server_addr = local_server_addr.unwrap();
-
-        let upstream_addr = parse_addr(dest_str)?;
+        let upstream_addr = parse_addr(parts[0])?;
+        let local_server_addr = parse_addr(parts[1])?;
 
         v.push(TunnelConfig {
             upstream: Upstream {
-                upstream_addr,
-                upstream_type: upstream_type.clone(),
+                upstream_addr: Some(upstream_addr),
+                upstream_type,
             },
             local_server_addr,
         });
@@ -399,5 +386,42 @@ pub fn socket_addr_with_unspecified_ip_port(ipv6: bool) -> SocketAddr {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     } else {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_addr_mappings, TunnelConfig, UpstreamType};
+
+    #[test]
+    fn parses_canonical_inbound_mapping() {
+        let mut tunnels = Vec::<TunnelConfig>::new();
+        parse_addr_mappings(
+            "127.0.0.1:8080^0.0.0.0:9000",
+            UpstreamType::Tcp,
+            &mut tunnels,
+        )
+        .unwrap();
+
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].local_server_addr.to_string(), "0.0.0.0:9000");
+        assert_eq!(
+            tunnels[0].upstream.upstream_addr.unwrap().to_string(),
+            "127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn rejects_mode_prefixes_and_dynamic_destinations() {
+        let mut tunnels = Vec::new();
+        assert!(parse_addr_mappings(
+            "IN^127.0.0.1:8080^0.0.0.0:9000",
+            UpstreamType::Tcp,
+            &mut tunnels,
+        )
+        .is_err());
+        assert!(
+            parse_addr_mappings("127.0.0.1:8080^ANY", UpstreamType::Tcp, &mut tunnels,).is_err()
+        );
     }
 }

@@ -1,5 +1,5 @@
 use crate::tcp::{StreamMessage, StreamReceiver, StreamRequest, StreamSender};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -8,11 +8,15 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::error::SendTimeoutError;
+use tokio::sync::watch;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
 /// Lightweight TCP listener that forwards accepted connections to a channel.
 pub struct TcpServer {
     state: Arc<Mutex<State>>,
+    owners: Arc<()>,
 }
 
 #[derive(Debug)]
@@ -22,6 +26,10 @@ struct State {
     tcp_receiver: Option<StreamReceiver<TcpStream>>,
     active: bool,
     terminated: bool,
+    shutdown_tx: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
+    shutdown_complete: Arc<Notify>,
+    completed: bool,
 }
 
 impl TcpServer {
@@ -32,18 +40,34 @@ impl TcpServer {
         let addr = tcp_listener.local_addr().unwrap();
 
         let (tcp_sender, tcp_receiver) = channel(128);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let state = Arc::new(Mutex::new(State {
             addr,
             tcp_sender: tcp_sender.clone(),
             tcp_receiver: Some(tcp_receiver),
             active: false,
             terminated: false,
+            shutdown_tx,
+            task: None,
+            shutdown_complete: Arc::new(Notify::new()),
+            completed: false,
         }));
         let state_clone = state.clone();
+        let task_state = state.clone();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
-                match tcp_listener.accept().await {
+                let accepted = tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    accepted = tcp_listener.accept() => accepted,
+                };
+
+                match accepted {
                     Ok((stream, addr)) => {
                         if let Err(e) = stream.set_nodelay(true) {
                             error!("failed to set TCP_NODELAY: {e}");
@@ -56,7 +80,7 @@ impl TcpServer {
 
                         {
                             let (terminated, active) = {
-                                let state = state.lock();
+                                let state = task_state.lock();
                                 (state.terminated, state.active)
                             };
 
@@ -104,18 +128,54 @@ impl TcpServer {
             info!("tcp server quit: {addr}");
         });
 
-        Ok(Self { state: state_clone })
+        state.lock().task = Some(task);
+
+        Ok(Self {
+            state: state_clone,
+            owners: Arc::new(()),
+        })
     }
 
     /// Request the server to shutdown gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
-        let addr = {
+        let (sender, task, shutdown_complete, completed) = {
             let mut state = self.state.lock();
-            state.terminated = true;
-            state.addr
+            let sender = if state.terminated {
+                None
+            } else {
+                state.terminated = true;
+                state.shutdown_tx.send(true).ok();
+                Some(state.tcp_sender.clone())
+            };
+            (
+                sender,
+                state.task.take(),
+                state.shutdown_complete.clone(),
+                state.completed,
+            )
         };
-        // initiate a new connection to wake up the accept() loop
-        TcpStream::connect(addr).await?;
+
+        if let Some(sender) = sender {
+            sender
+                .send_timeout(StreamMessage::Quit, Duration::from_millis(300))
+                .await
+                .ok();
+        }
+        if let Some(task) = task {
+            let result = task.await;
+            let mut state = self.state.lock();
+            state.completed = true;
+            state.shutdown_complete.notify_waiters();
+            result?;
+        } else if !completed {
+            loop {
+                let notified = shutdown_complete.notified();
+                if self.state.lock().completed {
+                    break;
+                }
+                notified.await;
+            }
+        }
         Ok(())
     }
 
@@ -125,10 +185,13 @@ impl TcpServer {
     }
 
     /// Take the receiver channel for accepted streams (sets server active=true).
-    pub fn take_receiver(&mut self) -> StreamReceiver<TcpStream> {
+    pub fn take_receiver(&mut self) -> Result<StreamReceiver<TcpStream>> {
         let mut state = self.state.lock();
         state.active = true;
-        state.tcp_receiver.take().unwrap()
+        state
+            .tcp_receiver
+            .take()
+            .context("TCP receiver has already been taken")
     }
 
     /// Put back a previously taken receiver channel (sets server active=false).
@@ -141,5 +204,70 @@ impl TcpServer {
     /// Clone a sender to receive future stream requests.
     pub fn clone_sender(&self) -> StreamSender<TcpStream> {
         self.state.lock().tcp_sender.clone()
+    }
+}
+
+impl Drop for TcpServer {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.owners) == 1 {
+            let mut state = self.state.lock();
+            if !state.terminated {
+                state.terminated = true;
+                state.shutdown_tx.send(true).ok();
+                state.tcp_sender.try_send(StreamMessage::Quit).ok();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TcpServer;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn concurrent_shutdown_waits_until_tcp_port_is_released() {
+        let mut server = TcpServer::bind_and_start(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let addr = server.addr();
+        let mut clone = server.clone();
+
+        let (first, second) = tokio::join!(server.shutdown(), clone.shutdown());
+        first.unwrap();
+        second.unwrap();
+
+        TcpListener::bind(addr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_last_handle_releases_tcp_port() {
+        let server = TcpServer::bind_and_start(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let addr = server.addr();
+        drop(server);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if TcpListener::bind(addr).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn taking_tcp_receiver_twice_returns_error() {
+        let mut server = TcpServer::bind_and_start(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let _receiver = server.take_receiver().unwrap();
+        assert!(server.take_receiver().is_err());
+        server.shutdown().await.unwrap();
     }
 }

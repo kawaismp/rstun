@@ -1,6 +1,6 @@
 use crate::BUFFER_POOL;
 use crate::UDP_PACKET_SIZE;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::debug;
 use log::error;
 use log::info;
@@ -9,13 +9,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::channel;
+use tokio::sync::watch;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::udp::{configure_udp_socket, UDP_CHANNEL_CAPACITY};
 pub use crate::udp::{UdpMessage, UdpPacket, UdpReceiver, UdpSender};
 
 #[derive(Debug, Clone)]
 /// Lightweight UDP helper that binds a local socket and bridges packets via channels.
-pub struct UdpServer(Arc<Mutex<State>>);
+pub struct UdpServer(Arc<Mutex<State>>, Arc<()>);
 
 #[derive(Debug)]
 struct State {
@@ -23,6 +26,11 @@ struct State {
     active: bool,
     in_udp_sender: UdpSender,
     udp_receiver: Option<UdpReceiver>,
+    terminated: bool,
+    shutdown_tx: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+    shutdown_complete: Arc<Notify>,
+    completed: bool,
 }
 
 impl UdpServer {
@@ -34,12 +42,18 @@ impl UdpServer {
 
         let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(UDP_CHANNEL_CAPACITY);
         let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(UDP_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let state = Arc::new(Mutex::new(State {
             addr,
             active: false,
             in_udp_sender,
             udp_receiver: Some(out_udp_receiver),
+            terminated: false,
+            shutdown_tx,
+            tasks: Vec::new(),
+            shutdown_complete: Arc::new(Notify::new()),
+            completed: false,
         }));
         let state_clone = state.clone();
 
@@ -50,10 +64,21 @@ impl UdpServer {
 
         // Spawn separate recv task
         let recv_state = state.clone();
-        tokio::spawn(async move {
+        let mut recv_shutdown = shutdown_rx.clone();
+        let recv_task = tokio::spawn(async move {
             let mut recv_buffer = vec![0u8; UDP_PACKET_SIZE];
             loop {
-                match recv_socket.recv_from(&mut recv_buffer).await {
+                let received = tokio::select! {
+                    changed = recv_shutdown.changed() => {
+                        if changed.is_err() || *recv_shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    received = recv_socket.recv_from(&mut recv_buffer) => received,
+                };
+
+                match received {
                     Ok((size, local_addr)) => {
                         let active = recv_state.lock().active;
                         if !active {
@@ -90,9 +115,20 @@ impl UdpServer {
         });
 
         // Spawn separate send task
-        tokio::spawn(async move {
+        let mut send_shutdown = shutdown_rx;
+        let send_task = tokio::spawn(async move {
             loop {
-                match in_udp_receiver.recv().await {
+                let message = tokio::select! {
+                    changed = send_shutdown.changed() => {
+                        if changed.is_err() || *send_shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    message = in_udp_receiver.recv() => message,
+                };
+
+                match message {
                     Some(UdpMessage::Packet(p)) => {
                         match send_socket.send_to(&p.payload, p.local_addr).await {
                             Ok(_) => {
@@ -117,7 +153,9 @@ impl UdpServer {
             info!("udp send task quit: {addr}");
         });
 
-        Ok(Self(state_clone))
+        state.lock().tasks.extend([recv_task, send_task]);
+
+        Ok(Self(state_clone, Arc::new(())))
     }
 
     /// Get the bound local address.
@@ -127,8 +165,41 @@ impl UdpServer {
 
     /// Ask the UDP server to shut down gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
-        let udp_sender = self.0.lock().in_udp_sender.clone();
-        udp_sender.send(UdpMessage::Quit).await?;
+        let (tasks, shutdown_complete, completed) = {
+            let mut state = self.0.lock();
+            if !state.terminated {
+                state.terminated = true;
+                state.shutdown_tx.send(true).ok();
+            }
+            (
+                std::mem::take(&mut state.tasks),
+                state.shutdown_complete.clone(),
+                state.completed,
+            )
+        };
+
+        if tasks.is_empty() {
+            if !completed {
+                loop {
+                    let notified = shutdown_complete.notified();
+                    if self.0.lock().completed {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
+        } else {
+            let mut result = Ok(());
+            for task in tasks {
+                if let Err(error) = task.await {
+                    result = Err(error);
+                }
+            }
+            let mut state = self.0.lock();
+            state.completed = true;
+            state.shutdown_complete.notify_waiters();
+            result?;
+        }
         Ok(())
     }
 
@@ -138,10 +209,13 @@ impl UdpServer {
     }
 
     /// Take the receiver side of the channel for reading inbound UDP packets (activates server).
-    pub fn take_receiver(&mut self) -> UdpReceiver {
+    pub fn take_receiver(&mut self) -> Result<UdpReceiver> {
         let mut state = self.0.lock();
         state.active = true;
-        state.udp_receiver.take().unwrap()
+        state
+            .udp_receiver
+            .take()
+            .context("UDP receiver has already been taken")
     }
 
     /// Put back a previously taken receiver (deactivates server).
@@ -154,5 +228,69 @@ impl UdpServer {
     /// Clone the sender used for delivering packets to the local UDP socket.
     pub fn clone_sender(&self) -> UdpSender {
         self.0.lock().in_udp_sender.clone()
+    }
+}
+
+impl Drop for UdpServer {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.1) == 1 {
+            let mut state = self.0.lock();
+            if !state.terminated {
+                state.terminated = true;
+                state.shutdown_tx.send(true).ok();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UdpServer;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn concurrent_shutdown_waits_until_udp_port_is_released() {
+        let mut server = UdpServer::bind_and_start(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let addr = server.addr();
+        let mut clone = server.clone();
+
+        let (first, second) = tokio::join!(server.shutdown(), clone.shutdown());
+        first.unwrap();
+        second.unwrap();
+
+        UdpSocket::bind(addr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_last_handle_releases_udp_port() {
+        let server = UdpServer::bind_and_start(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let addr = server.addr();
+        drop(server);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if UdpSocket::bind(addr).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn taking_udp_receiver_twice_returns_error() {
+        let mut server = UdpServer::bind_and_start(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let _receiver = server.take_receiver().unwrap();
+        assert!(server.take_receiver().is_err());
+        server.shutdown().await.unwrap();
     }
 }

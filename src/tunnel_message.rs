@@ -11,36 +11,53 @@ use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_UDP_BATCH_BYTES: usize = 128 * 1024;
+const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_CLIENT_ID_BYTES: usize = 128;
+
+fn validate_control_message_len(len: usize) -> Result<()> {
+    if len > MAX_CONTROL_MESSAGE_BYTES {
+        bail!("control message too large: {len} bytes");
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 /// Control/data messages used during login and per-packet coordination.
 pub enum TunnelMessage {
-    /// Client → Server: authenticate and declare desired tunnel.
-    ReqLogin(LoginInfo),
-    /// Server → Client: failure with reason.
-    RespFailure(String),
-    /// Server ↔ Client: success acknowledgement.
-    RespSuccess,
-    /// Server → Client: success, but took over an existing connection.
-    RespSuccessPreempted,
-    /// Server → Client: Are you still alive?
-    Ping,
-    /// Client → Server: Yes, I am.
-    Pong,
+    /// Client → Server: authenticate and declare the requested tunnel.
+    Login(LoginRequest),
+    /// Server → Client: result of the login request.
+    LoginResponse(LoginResponse),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-/// Login payload containing password and requested tunnel description.
-pub(crate) struct LoginInfo {
+/// Login payload containing authentication, ownership, and tunnel details.
+pub(crate) struct LoginRequest {
     pub password: String,
+    pub client_id: String,
     pub tunnel: Tunnel,
 }
 
-impl LoginInfo {
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoginResponse {
+    Accepted { replaced_previous: bool },
+    Rejected { reason: String },
+}
+
+impl LoginRequest {
+    pub fn validate_client_id(client_id: &str) -> Result<()> {
+        if client_id.trim().is_empty() {
+            bail!("client_id must not be empty");
+        }
+        if client_id.len() > MAX_CLIENT_ID_BYTES {
+            bail!("client_id must not exceed {MAX_CLIENT_ID_BYTES} bytes");
+        }
+        Ok(())
+    }
+
     /// Format a human-friendly description including the remote address.
     pub fn format_with_remote_addr(&self, remote_addr: &SocketAddr) -> String {
         match &self.tunnel {
@@ -68,7 +85,7 @@ impl LoginInfo {
     }
 }
 
-impl Display for LoginInfo {
+impl Display for LoginRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.tunnel {
             Tunnel::ChannelBased(upstream_type) => {
@@ -84,12 +101,16 @@ impl Display for LoginInfo {
 impl Display for TunnelMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ReqLogin(login_info) => f.write_str(login_info.to_string().as_str()),
-            Self::RespFailure(msg) => f.write_str(format!("fail:{msg}").as_str()),
-            Self::RespSuccess => f.write_str("succeeded"),
-            Self::RespSuccessPreempted => f.write_str("succeeded (preempted old connection)"),
-            Self::Ping => f.write_str("ping"),
-            Self::Pong => f.write_str("pong"),
+            Self::Login(request) => f.write_str(request.to_string().as_str()),
+            Self::LoginResponse(LoginResponse::Accepted {
+                replaced_previous: false,
+            }) => f.write_str("accepted"),
+            Self::LoginResponse(LoginResponse::Accepted {
+                replaced_previous: true,
+            }) => f.write_str("accepted (replaced previous session)"),
+            Self::LoginResponse(LoginResponse::Rejected { reason }) => {
+                write!(f, "rejected: {reason}")
+            }
         }
     }
 }
@@ -98,6 +119,7 @@ impl TunnelMessage {
     /// Receive and decode a TunnelMessage from the given QUIC recv stream.
     pub async fn recv(quic_recv: &mut RecvStream) -> Result<TunnelMessage> {
         let msg_len = quic_recv.read_u32().await? as usize;
+        validate_control_message_len(msg_len)?;
         let mut msg = vec![0; msg_len];
         quic_recv
             .read_exact(&mut msg)
@@ -112,18 +134,17 @@ impl TunnelMessage {
     /// Encode and send a TunnelMessage via the given QUIC send stream.
     pub async fn send(quic_send: &mut SendStream, msg: &TunnelMessage) -> Result<()> {
         let msg = postcard::to_allocvec(msg).context("serialize message failed")?;
+        validate_control_message_len(msg.len())?;
         quic_send.write_u32(msg.len() as u32).await?;
         quic_send.write_all(&msg).await?;
+        quic_send.finish()?;
         Ok(())
     }
 
-    /// Convenience to send a failure response and flush.
-    pub async fn send_failure(quic_send: &mut SendStream, msg: String) -> Result<()> {
-        let msg = TunnelMessage::RespFailure(msg);
-        Self::send(quic_send, &msg).await?;
-        quic_send.flush().await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        Ok(())
+    /// Send a rejected login response.
+    pub async fn send_rejection(quic_send: &mut SendStream, reason: String) -> Result<()> {
+        let msg = TunnelMessage::LoginResponse(LoginResponse::Rejected { reason });
+        Self::send(quic_send, &msg).await
     }
 
     /// Start a reusable UDP batch with room for its wire-length prefix.
@@ -238,20 +259,15 @@ impl TunnelMessage {
         let payload = take(data, cursor, payload_len)?;
         Ok(Some((peer_addr, payload)))
     }
-
-    /// Validate a response message, returning Ok for RespSuccess else error.
-    pub fn handle_message(msg: &TunnelMessage) -> Result<()> {
-        match msg {
-            TunnelMessage::RespSuccess | TunnelMessage::RespSuccessPreempted => Ok(()),
-            TunnelMessage::RespFailure(msg) => bail!(format!("received failure, err: {msg}")),
-            _ => bail!("unexpected message type"),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TunnelMessage;
+    use super::{
+        validate_control_message_len, LoginRequest, LoginResponse, TunnelMessage,
+        MAX_CONTROL_MESSAGE_BYTES,
+    };
+    use crate::{Tunnel, TunnelConfig, Upstream, UpstreamType};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
@@ -295,5 +311,50 @@ mod tests {
         assert_eq!(frame[0], 6);
         assert_eq!(&frame[1..17], &Ipv6Addr::LOCALHOST.octets());
         assert_eq!(&frame[17..], &[0, 53, 0, 1, b'z']);
+    }
+
+    #[test]
+    fn login_protocol_round_trips() {
+        let login_request = LoginRequest {
+            password: "secret".to_string(),
+            client_id: "home-gateway".to_string(),
+            tunnel: Tunnel::NetworkBased(TunnelConfig {
+                upstream: Upstream {
+                    upstream_addr: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080)),
+                    upstream_type: UpstreamType::Tcp,
+                },
+                local_server_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 3000),
+            }),
+        };
+        let encoded = postcard::to_allocvec(&TunnelMessage::Login(login_request)).unwrap();
+
+        match postcard::from_bytes::<TunnelMessage>(&encoded).unwrap() {
+            TunnelMessage::Login(request) => assert_eq!(request.client_id, "home-gateway"),
+            message => panic!("unexpected decoded message: {message:?}"),
+        }
+
+        let response = TunnelMessage::LoginResponse(LoginResponse::Accepted {
+            replaced_previous: true,
+        });
+        let encoded = postcard::to_allocvec(&response).unwrap();
+        match postcard::from_bytes::<TunnelMessage>(&encoded).unwrap() {
+            TunnelMessage::LoginResponse(LoginResponse::Accepted { replaced_previous }) => {
+                assert!(replaced_previous)
+            }
+            message => panic!("unexpected decoded message: {message:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_control_messages_before_allocation() {
+        assert!(validate_control_message_len(MAX_CONTROL_MESSAGE_BYTES).is_ok());
+        assert!(validate_control_message_len(MAX_CONTROL_MESSAGE_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn validates_client_identifiers() {
+        assert!(LoginRequest::validate_client_id("home-gateway").is_ok());
+        assert!(LoginRequest::validate_client_id("  ").is_err());
+        assert!(LoginRequest::validate_client_id(&"x".repeat(129)).is_err());
     }
 }

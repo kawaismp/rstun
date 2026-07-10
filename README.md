@@ -25,6 +25,7 @@ This fork focuses on maximum performance and minimal bloat for trusted networks:
 - **TLS-based QUIC handshake**: Certificate handling and configurable TLS 1.3 cipher selection; payload protection is deliberately disabled in this build.
 - **Automatic or custom certificates**: Use your own certificate/key or let rstun generate a self-signed certificate for testing.
 - **Connection migration**: Optional periodic migration of QUIC connection to new random local UDP ports to avoid throttling during long data transfers.
+- **Safe automatic reconnects**: A reconnecting client atomically replaces only its own previous tunnel session; listeners are shut down and released before the port is rebound.
 
 ---
 
@@ -78,6 +79,7 @@ udp_idle_ms = 30000
 ```toml
 # rstunc client configuration
 server_address = "127.0.0.1:6060"
+client_id = "home-gateway"
 password = "super_secure_pa$$word"
 workers = 4
 log_level = "info"
@@ -105,7 +107,7 @@ bind = "0.0.0.0:25565"
 destination = "127.0.0.1:25565"
 ```
 
-### CLI Configuration (Legacy)
+### CLI Configuration
 
 <details>
 <summary>Click to view command-line flag documentation</summary>
@@ -120,6 +122,7 @@ rstund --addr 0.0.0.0:6060 --password 123456
 #### Start the client
 ```sh
 rstunc --server-addr 1.2.3.4:6060 --password 123456 \
+  --client-id home-gateway \
   --tcp-mappings "127.0.0.1:8080^9000" \
   --udp-mappings "0.0.0.0:25565^25565" \
   --hop-interval-ms 30000
@@ -140,6 +143,7 @@ rstunc --server-addr 1.2.3.4:6060 --password 123456 \
 ```
   --config <FILE>                  Path to TOML configuration file
   -a, --server-addr <ADDR>         Server address (<domain:ip>[:port])
+      --client-id <ID>             Stable logical client identifier
   -p, --password <PASSWORD>        Password for server authentication
   -t, --tcp-mappings <MAPPINGS>    Comma-separated TCP tunnel mappings
   -u, --udp-mappings <MAPPINGS>    Comma-separated UDP tunnel mappings

@@ -1,5 +1,6 @@
 # rstunc client configuration
 server_address = "127.0.0.1:6060"
+client_id = "home-gateway"
 password = "change_this_password"
 workers = 0             # 0 = auto
 log_level = "info"

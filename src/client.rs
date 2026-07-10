@@ -2,9 +2,9 @@ use crate::{
     noprotection::NoProtectionClientConfig,
     pem_util, socket_addr_with_unspecified_ip_port,
     tcp::{tcp_tunnel::TcpTunnel, AsyncStream, StreamReceiver, StreamRequest},
-    tunnel_message::TunnelMessage,
+    tunnel_message::{LoginResponse, TunnelMessage},
     udp::{udp_server::UdpServer, udp_tunnel::UdpTunnel, UdpReceiver, UdpSender},
-    ClientConfig, LoginInfo, SelectedCipherSuite, TcpServer, Tunnel, TunnelConfig, UpstreamType,
+    ClientConfig, LoginRequest, SelectedCipherSuite, TcpServer, Tunnel, TunnelConfig, UpstreamType,
     QUIC_CONNECTION_WINDOW, QUIC_MAX_CONCURRENT_BIDI_STREAMS, QUIC_SEND_WINDOW,
     QUIC_STREAM_RECEIVE_WINDOW,
 };
@@ -36,6 +36,7 @@ use tokio::net::TcpStream;
 
 const DEFAULT_SERVER_PORT: u16 = 3515;
 const POST_TRAFFIC_DATA_INTERVAL_SECS: u64 = 30;
+const LOGIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 static INIT: Once = Once::new();
 
 #[derive(Clone, Serialize, PartialEq)]
@@ -79,7 +80,6 @@ struct State {
     connections: AHashMap<SocketAddr, Connection>,
     client_state: ClientState,
     total_traffic_data: TunnelTraffic,
-
 }
 
 impl State {
@@ -107,6 +107,7 @@ struct LoginConfig {
 pub struct Client {
     config: ClientConfig,
     inner_state: Arc<Mutex<State>>,
+    client_id: String,
 }
 
 macro_rules! inner_state {
@@ -117,17 +118,21 @@ macro_rules! inner_state {
 
 impl Client {
     /// Create a client with the given runtime configuration.
-    pub fn new(config: ClientConfig) -> Self {
+    pub fn new(config: ClientConfig) -> Result<Self> {
         INIT.call_once(|| {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .unwrap();
         });
 
-        Client {
+        LoginRequest::validate_client_id(&config.client_id)?;
+
+        let client_id = config.client_id.clone();
+        Ok(Client {
             config,
             inner_state: Arc::new(Mutex::new(State::new())),
-        }
+            client_id,
+        })
     }
 
     /// Start the runtime (multi-threaded tokio) and block the current thread until Ctrl-C.
@@ -351,8 +356,9 @@ impl Client {
         mut stream_receiver: Option<StreamReceiver<S>>,
         mut ch: Option<(UdpSender, UdpReceiver)>,
     ) {
-        let login_info = LoginInfo {
+        let login_request = LoginRequest {
             password: self.config.password.clone(),
+            client_id: self.client_id.clone(),
             tunnel: tunnel.clone(),
         };
 
@@ -376,7 +382,7 @@ impl Client {
                     .login(
                         index,
                         &endpoint,
-                        &login_info,
+                        &login_request,
                         &login_cfg.remote_addr,
                         login_cfg.domain.as_str(),
                     )
@@ -464,7 +470,7 @@ impl Client {
                 Err(e) => {
                     error!("{e}");
                     info!(
-                        "[{login_info}] quit after having retried for {} times",
+                        "[{login_request}] quit after having retried for {} times",
                         usize::MAX
                     );
                     break;
@@ -475,7 +481,7 @@ impl Client {
                 break;
             }
         }
-        self.post_tunnel_log(format!("[{login_info}] quit").as_str());
+        self.post_tunnel_log(format!("[{login_request}] quit").as_str());
     }
 
     async fn handle_network_based_tunnel(
@@ -548,7 +554,7 @@ impl Client {
         &self,
         index: usize,
         endpoint: &Endpoint,
-        login_info: &LoginInfo,
+        login_request: &LoginRequest,
         remote_addr: &SocketAddr,
         domain: &str,
     ) -> Result<Connection> {
@@ -556,7 +562,7 @@ impl Client {
         self.post_tunnel_log(
             format!(
                 "{index}:{} connecting, idle_timeout:{}, retry_timeout:{}, cipher:{}, threads:{}",
-                login_info.format_with_remote_addr(remote_addr),
+                login_request.format_with_remote_addr(remote_addr),
                 self.config.quic_timeout_ms,
                 self.config.wait_before_retry_ms,
                 self.config.cipher,
@@ -576,51 +582,48 @@ impl Client {
         self.post_tunnel_log(
             format!(
                 "{index}:{} logging in...",
-                login_info.format_with_remote_addr(remote_addr)
+                login_request.format_with_remote_addr(remote_addr)
             )
             .as_str(),
         );
 
-        let login_msg = TunnelMessage::ReqLogin(login_info.clone());
+        let login_msg = TunnelMessage::Login(login_request.clone());
         TunnelMessage::send(&mut quic_send, &login_msg).await?;
 
-        let resp = TunnelMessage::recv(&mut quic_recv).await?;
+        let resp =
+            tokio::time::timeout(LOGIN_RESPONSE_TIMEOUT, TunnelMessage::recv(&mut quic_recv))
+                .await
+                .context("login response timed out")??;
         match resp {
-            TunnelMessage::RespSuccess => {}
-            TunnelMessage::RespSuccessPreempted => {
+            TunnelMessage::LoginResponse(LoginResponse::Accepted {
+                replaced_previous: false,
+            }) => {}
+            TunnelMessage::LoginResponse(LoginResponse::Accepted {
+                replaced_previous: true,
+            }) => {
                 self.post_tunnel_log(
                     format!(
-                        "{index}:{} took over existing dead connection!",
-                        login_info.format_with_remote_addr(remote_addr)
+                        "{index}:{} replaced its previous session",
+                        login_request.format_with_remote_addr(remote_addr)
                     )
                     .as_str(),
                 );
             }
-            TunnelMessage::RespFailure(msg) => {
+            TunnelMessage::LoginResponse(LoginResponse::Rejected { reason }) => {
                 bail!(
-                    "{index}:{} failed to login: {msg}",
-                    login_info.format_with_remote_addr(remote_addr)
+                    "{index}:{} failed to login: {reason}",
+                    login_request.format_with_remote_addr(remote_addr)
                 )
             }
-            _ => bail!("unexpected message type"),
+            TunnelMessage::Login(_) => bail!("server sent a login request instead of a response"),
         }
-
-        TunnelMessage::handle_message(&resp)?;
         self.post_tunnel_log(
             format!(
                 "{index}:{} started",
-                login_info.format_with_remote_addr(remote_addr)
+                login_request.format_with_remote_addr(remote_addr)
             )
             .as_str(),
         );
-
-        tokio::spawn(async move {
-            while let Ok(msg) = TunnelMessage::recv(&mut quic_recv).await {
-                if matches!(msg, TunnelMessage::Ping) {
-                    TunnelMessage::send(&mut quic_send, &TunnelMessage::Pong).await.ok();
-                }
-            }
-        });
 
         Ok(conn)
     }
@@ -970,5 +973,119 @@ impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
             warn!("======================= Be cautious, this is for TEST only!!! ========================");
         });
         Ok(ServerCertVerified::assertion())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Server, ServerConfig, Upstream};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    fn test_client_config(server_addr: SocketAddr, client_id: &str) -> ClientConfig {
+        ClientConfig {
+            client_id: client_id.to_string(),
+            cipher: "aes-128-gcm".to_string(),
+            server_addr: server_addr.to_string(),
+            password: "integration-secret".to_string(),
+            quic_timeout_ms: 3_000,
+            tcp_timeout_ms: 3_000,
+            udp_timeout_ms: 3_000,
+            workers: 1,
+            ..ClientConfig::default()
+        }
+    }
+
+    async fn create_endpoint(client: &Client) -> Result<(Endpoint, SocketAddr, String)> {
+        let login_config = client.prepare_login_config().await?;
+        let mut endpoint = Endpoint::client(login_config.local_addr)?;
+        endpoint.set_default_client_config(login_config.quinn_client_cfg);
+        Ok((endpoint, login_config.remote_addr, login_config.domain))
+    }
+
+    #[tokio::test]
+    async fn reconnect_replaces_same_client_and_rejects_competitor() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mut server = Server::new(ServerConfig {
+            addr: "127.0.0.1:0".to_string(),
+            password: "integration-secret".to_string(),
+            cert_path: format!("{manifest_dir}/localhost.crt.pem"),
+            key_path: format!("{manifest_dir}/localhost.key.pem"),
+            quic_timeout_ms: 3_000,
+            tcp_timeout_ms: 3_000,
+            udp_timeout_ms: 3_000,
+            ..ServerConfig::default()
+        });
+        let server_addr = server.bind().unwrap();
+        let server_task = tokio::spawn(async move { server.serve().await });
+
+        let probe = tokio::net::TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .await
+            .unwrap();
+        let tunnel_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let request_for = |client_id: &str| LoginRequest {
+            password: "integration-secret".to_string(),
+            client_id: client_id.to_string(),
+            tunnel: Tunnel::NetworkBased(TunnelConfig {
+                upstream: Upstream {
+                    upstream_addr: Some(tunnel_addr),
+                    upstream_type: UpstreamType::Tcp,
+                },
+                local_server_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9),
+            }),
+        };
+
+        let owner = Client::new(test_client_config(server_addr, "stable-owner")).unwrap();
+        let (owner_endpoint, remote_addr, domain) = create_endpoint(&owner).await.unwrap();
+        let first = owner
+            .login(
+                0,
+                &owner_endpoint,
+                &request_for("stable-owner"),
+                &remote_addr,
+                &domain,
+            )
+            .await
+            .unwrap();
+        let restarted_owner = Client::new(test_client_config(server_addr, "stable-owner")).unwrap();
+        let (restarted_endpoint, restarted_remote, restarted_domain) =
+            create_endpoint(&restarted_owner).await.unwrap();
+        let second = restarted_owner
+            .login(
+                0,
+                &restarted_endpoint,
+                &request_for("stable-owner"),
+                &restarted_remote,
+                &restarted_domain,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), first.closed())
+            .await
+            .expect("previous connection was not closed after replacement");
+
+        let competitor = Client::new(test_client_config(server_addr, "competitor")).unwrap();
+        let (competitor_endpoint, competitor_remote, competitor_domain) =
+            create_endpoint(&competitor).await.unwrap();
+        let rejected = competitor
+            .login(
+                0,
+                &competitor_endpoint,
+                &request_for("competitor"),
+                &competitor_remote,
+                &competitor_domain,
+            )
+            .await;
+        assert!(rejected.is_err());
+        assert!(second.close_reason().is_none());
+
+        second.close(VarInt::from_u32(0), b"test complete");
+        owner_endpoint.close(VarInt::from_u32(0), b"test complete");
+        restarted_endpoint.close(VarInt::from_u32(0), b"test complete");
+        competitor_endpoint.close(VarInt::from_u32(0), b"test complete");
+        server_task.abort();
     }
 }

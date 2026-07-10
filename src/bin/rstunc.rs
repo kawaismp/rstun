@@ -42,6 +42,7 @@ struct DnsToml {
 #[derive(serde::Deserialize)]
 struct RstuncToml {
     server_address: Option<String>,
+    client_id: Option<String>,
     password: Option<String>,
     workers: Option<usize>,
     log_level: Option<String>,
@@ -53,10 +54,6 @@ struct RstuncToml {
     timeouts: Option<TimeoutsToml>,
 
     tunnels: Option<Vec<TomlTunnel>>,
-
-    // Legacy support
-    tcp_mappings: Option<String>,
-    udp_mappings: Option<String>,
 }
 
 fn main() {
@@ -66,6 +63,7 @@ fn main() {
         if !std::path::Path::new("rstunc.toml").exists() {
             let default_config = r#"# rstunc client configuration
 server_address = "127.0.0.1:6060"
+client_id = "home-gateway"
 password = "change_this_password"
 workers = 0             # 0 = auto
 log_level = "info"
@@ -109,6 +107,11 @@ destination = "9000"
         if let Some(v) = toml.server_address {
             if args.server_addr.is_empty() {
                 args.server_addr = v;
+            }
+        }
+        if let Some(v) = toml.client_id {
+            if args.client_id.is_empty() {
+                args.client_id = v;
             }
         }
         if let Some(v) = toml.password {
@@ -217,21 +220,10 @@ destination = "9000"
                 args.udp_mappings = udp_mappings.join(",");
             }
         }
-
-        if let Some(v) = toml.tcp_mappings {
-            if args.tcp_mappings.is_empty() {
-                args.tcp_mappings = v;
-            }
-        }
-        if let Some(v) = toml.udp_mappings {
-            if args.udp_mappings.is_empty() {
-                args.udp_mappings = v;
-            }
-        }
     }
 
-    if args.server_addr.is_empty() || args.password.is_empty() {
-        println!("server_addr and password are required (via CLI or TOML config)");
+    if args.server_addr.is_empty() || args.client_id.is_empty() || args.password.is_empty() {
+        println!("server_addr, client_id, and password are required (via CLI or TOML config)");
         std::process::exit(1);
     }
 
@@ -240,6 +232,7 @@ destination = "9000"
 
     let config = ClientConfig::create(
         &args.server_addr,
+        &args.client_id,
         &args.password,
         &args.cert,
         &args.cipher,
@@ -259,8 +252,10 @@ destination = "9000"
     });
 
     if let Ok(config) = config {
-        let mut client = Client::new(config);
-        client.start_tunneling();
+        match Client::new(config) {
+            Ok(mut client) => client.start_tunneling(),
+            Err(error) => error!("{error}"),
+        }
     }
 }
 
@@ -275,17 +270,21 @@ struct RstuncArgs {
     #[arg(short = 'a', long, default_value = "")]
     server_addr: String,
 
+    /// Stable identifier for this logical client across process restarts.
+    #[arg(long, default_value = "")]
+    client_id: String,
+
     /// Password for server authentication (must match server's password)
     #[arg(short = 'p', long, default_value = "")]
     password: String,
 
-    /// Comma-separated list of TCP tunnel mappings. Each mapping is in the form MODE^[ip:]port^[ip:]port, e.g. OUT^8080^0.0.0.0:9090
-    /// MODE is either OUT or IN. Use OUT^8000^ANY to use the server's default upstream for OUT mode.
+    /// Comma-separated inbound TCP mappings in the form bind^destination,
+    /// e.g. 0.0.0.0:9090^127.0.0.1:8080.
     #[arg(short = 't', long, verbatim_doc_comment, default_value = "")]
     tcp_mappings: String,
 
-    /// Comma-separated list of UDP tunnel mappings. Each mapping is in the form MODE^[ip:]port^[ip:]port, e.g. OUT^8080^0.0.0.0:9090
-    /// MODE is either OUT or IN. Use OUT^8000^ANY to use the server's default upstream for OUT mode.
+    /// Comma-separated inbound UDP mappings in the form bind^destination,
+    /// e.g. 0.0.0.0:9090^127.0.0.1:8080.
     #[arg(short = 'u', long, verbatim_doc_comment, default_value = "")]
     udp_mappings: String,
 
