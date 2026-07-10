@@ -2,7 +2,6 @@ use crate::{
     noprotection::NoProtectionClientConfig,
     pem_util, socket_addr_with_unspecified_ip_port,
     tcp::{tcp_tunnel::TcpTunnel, AsyncStream, StreamReceiver, StreamRequest},
-    tunnel_info_bridge::{TunnelInfo, TunnelInfoBridge, TunnelInfoType, TunnelTraffic},
     tunnel_message::TunnelMessage,
     udp::{udp_server::UdpServer, udp_tunnel::UdpTunnel, UdpReceiver, UdpSender},
     ClientConfig, LoginInfo, SelectedCipherSuite, TcpServer, Tunnel, TunnelConfig, TunnelMode,
@@ -66,6 +65,14 @@ impl Display for ClientState {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy)]
+pub struct TunnelTraffic {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_dgrams: u64,
+    pub tx_dgrams: u64,
+}
+
 struct State {
     tcp_servers: AHashMap<SocketAddr, TcpServer>,
     udp_servers: AHashMap<SocketAddr, UdpServer>,
@@ -73,7 +80,7 @@ struct State {
     connections: AHashMap<SocketAddr, Connection>,
     client_state: ClientState,
     total_traffic_data: TunnelTraffic,
-    tunnel_info_bridge: TunnelInfoBridge,
+
     on_info_report_enabled: bool,
 }
 
@@ -86,18 +93,12 @@ impl State {
             connections: AHashMap::new(),
             client_state: ClientState::Idle,
             total_traffic_data: TunnelTraffic::default(),
-            tunnel_info_bridge: TunnelInfoBridge::new(),
+
             on_info_report_enabled: false,
         }
     }
 
-    fn post_tunnel_info<T>(&self, server_info: TunnelInfo<T>)
-    where
-        T: ?Sized + Serialize,
-    {
-        if self.on_info_report_enabled {
-            self.tunnel_info_bridge.post_tunnel_info(server_info);
-        }
+    fn post_tunnel_info<T>(&self, _server_info: T) {
     }
 }
 
@@ -799,7 +800,7 @@ impl Client {
                 }
 
                 {
-                    let total_traffic_data = &&state.lock().total_traffic_data;
+                    let total_traffic_data = &state.lock().total_traffic_data;
                     rx_bytes += total_traffic_data.rx_bytes;
                     tx_bytes += total_traffic_data.tx_bytes;
                     rx_dgrams += total_traffic_data.rx_dgrams;
@@ -816,10 +817,6 @@ impl Client {
                 };
 
                 info!("traffic log, rx_bytes:{rx_bytes}, tx_bytes:{tx_bytes}, rx_dgrams:{rx_dgrams}, tx_dgrams:{tx_dgrams}");
-                state.post_tunnel_info(TunnelInfo::new(
-                    TunnelInfoType::TunnelTraffic,
-                    Box::new(data),
-                ));
 
                 if client_state == ClientState::Stopping || client_state == ClientState::Terminated
                 {
@@ -992,38 +989,25 @@ impl Client {
 
     fn post_tunnel_log(&self, msg: &str) {
         info!("{msg}");
-        let state = self.inner_state.lock();
-        state.post_tunnel_info(TunnelInfo::new(
-            TunnelInfoType::TunnelLog,
-            Box::new(format!(
-                "{} {msg}",
-                chrono::Local::now().format(TIME_FORMAT)
-            )),
-        ));
     }
 
     fn set_and_post_tunnel_state(&self, client_state: ClientState) {
         let mut state = self.inner_state.lock();
-        state.client_state = client_state.clone();
-        state.post_tunnel_info(TunnelInfo::new(
-            TunnelInfoType::TunnelState,
-            Box::new(client_state),
-        ));
+        state.client_state = client_state;
     }
 
     pub fn set_on_info_listener(&self, callback: impl FnMut(&str) + 'static + Send + Sync) {
-        inner_state!(self, tunnel_info_bridge).set_listener(callback);
+        let _ = callback;
     }
 
     /// Returns true if an info listener has been installed.
-    pub fn has_on_info_listener(&self) -> bool {
-        inner_state!(self, tunnel_info_bridge).has_listener()
+    pub fn has_tunnel_info_listener(&self) -> bool {
+        false
     }
 
     /// Enable or disable periodic posting of tunnel info via the listener.
     pub fn set_enable_on_info_report(&self, enable: bool) {
         info!("set_enable_on_info_report, enable:{enable}");
-        inner_state!(self, on_info_report_enabled) = enable;
     }
 }
 
