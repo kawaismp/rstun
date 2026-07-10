@@ -2,6 +2,9 @@ name: Rust
 
 on: [push]
 
+permissions:
+  contents: write
+
 jobs:
   linux-x86_64:
     name: Linux x86_64
