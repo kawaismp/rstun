@@ -140,18 +140,21 @@ impl Client {
     ///
     /// Spawns tasks to connect and serve all tunnels in [ClientConfig::tunnels].
     pub fn start_tunneling(&mut self) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        ctrlc::set_handler(move || tx.send(()).expect("Could not send signal on channel."))
-            .expect("Error setting Ctrl-C handler");
+        let mut builder = if self.config.workers == 1 {
+            tokio::runtime::Builder::new_current_thread()
+        } else {
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(self.config.workers);
+            b
+        };
 
-        tokio::runtime::Builder::new_multi_thread()
+        builder
             .enable_all()
-            .worker_threads(self.config.workers)
             .build()
             .unwrap()
             .block_on(async {
                 self.connect_and_serve_async();
-                rx.recv().expect("Could not receive from channel.");
+                let _ = tokio::signal::ctrl_c().await;
                 self.stop_async().await;
             });
     }

@@ -26,7 +26,7 @@ fn main() {
     let workers = if args.workers > 0 {
         args.workers
     } else {
-        num_cpus::get()
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     };
 
     info!("will use {} workers", workers);

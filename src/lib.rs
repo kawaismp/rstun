@@ -351,7 +351,7 @@ impl ClientConfig {
             workers: if workers > 0 {
                 workers
             } else {
-                num_cpus::get()
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
             },
             wait_before_retry_ms,
             quic_timeout_ms,
