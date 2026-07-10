@@ -37,14 +37,7 @@ fn main() {
     if let Ok(config) = config {
         let mut client = Client::new(config);
 
-        #[cfg(target_os = "android")]
-        {
-            use log::info;
-            client.set_enable_on_info_report(true);
-            client.set_on_info_listener(|s| {
-                info!("{}", s);
-            });
-        }
+
 
         client.start_tunneling();
     }

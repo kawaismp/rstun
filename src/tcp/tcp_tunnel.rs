@@ -138,7 +138,7 @@ impl TcpTunnel {
                                 error!("failed to set TCP_NODELAY: {e}");
                             }
 
-                            #[cfg(any(target_os = "linux", target_os = "android"))]
+                            #[cfg(target_os = "linux")]
                             if let Err(e) = request.set_quickack(true) {
                                 error!("failed to set TCP_QUICKACK: {e}");
                             }

@@ -143,7 +143,7 @@ impl Server {
         transport_cfg.stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
         transport_cfg.receive_window(VarInt::from_u32(QUIC_CONNECTION_WINDOW));
         transport_cfg.send_window(QUIC_SEND_WINDOW);
-        transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+        transport_cfg.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         transport_cfg.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
 
         if config.quic_timeout_ms > 0 {

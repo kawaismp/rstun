@@ -137,15 +137,9 @@ impl StreamUtil {
         quic_send: &mut SendStream,
         buffer: &mut [u8],
         transfer_bytes: &mut u64,
-        stream_timeout_ms: u64,
+        _stream_timeout_ms: u64,
     ) -> Result<usize, TransferError> {
-        let len_read = tokio::time::timeout(
-            Duration::from_millis(stream_timeout_ms),
-            stream_read.read(buffer),
-        )
-        .await
-        .map_err(|_: Elapsed| TransferError::TimeoutError)?
-        .map_err(|_| TransferError::InternalError)?;
+        let len_read = stream_read.read(buffer).await.map_err(|_| TransferError::InternalError)?;
         if len_read > 0 {
             *transfer_bytes += len_read as u64;
             quic_send
@@ -166,15 +160,9 @@ impl StreamUtil {
         stream_write: &mut WriteHalf<S>,
         buffer: &mut [u8],
         transfer_bytes: &mut u64,
-        stream_timeout_ms: u64,
+        _stream_timeout_ms: u64,
     ) -> Result<usize, TransferError> {
-        let result = tokio::time::timeout(
-            Duration::from_millis(stream_timeout_ms),
-            quic_recv.read(buffer),
-        )
-        .await
-        .map_err(|_: Elapsed| TransferError::TimeoutError)?
-        .map_err(|_| TransferError::InternalError)?;
+        let result = quic_recv.read(buffer).await.map_err(|_| TransferError::InternalError)?;
         if let Some(len_read) = result {
             *transfer_bytes += len_read as u64;
             stream_write

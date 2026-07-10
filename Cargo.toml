@@ -36,18 +36,6 @@ libc = "0.2.177"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
-[dev-dependencies]
-jni = "0.21.1"
-android_logger = "0.15.1"
-
-[target.aarch64-linux-android.dependencies]
-jni = "0.21.1"
-android_logger = "0.15.1"
-
-[target.armv7-linux-androideabi.dependencies]
-jni = "0.21.1"
-android_logger = "0.15.1"
-
 [profile.release]
 opt-level = 3
 strip = true
