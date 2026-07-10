@@ -24,10 +24,15 @@ jobs:
 
       - name: Build Linux binaries
         run: |
-          cargo build --all-features --release
           mkdir -p rstun-linux-x86_64
-          mv target/release/rstunc ./rstun-linux-x86_64/
+          
+          echo "Building rstund (Server)"
+          RUSTFLAGS="-C target-cpu=x86-64" CFLAGS="-march=x86-64" CXXFLAGS="-march=x86-64" cargo build --bin rstund --all-features --release
           mv target/release/rstund ./rstun-linux-x86_64/
+          
+          echo "Building rstunc (Client)"
+          RUSTFLAGS="-C target-cpu=haswell" CFLAGS="-march=haswell" CXXFLAGS="-march=haswell" cargo build --bin rstunc --all-features --release
+          mv target/release/rstunc ./rstun-linux-x86_64/
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
