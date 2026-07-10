@@ -139,7 +139,10 @@ impl StreamUtil {
         transfer_bytes: &mut u64,
         _stream_timeout_ms: u64,
     ) -> Result<usize, TransferError> {
-        let len_read = stream_read.read(buffer).await.map_err(|_| TransferError::InternalError)?;
+        let len_read = stream_read
+            .read(buffer)
+            .await
+            .map_err(|_| TransferError::InternalError)?;
         if len_read > 0 {
             *transfer_bytes += len_read as u64;
             quic_send
@@ -162,7 +165,10 @@ impl StreamUtil {
         transfer_bytes: &mut u64,
         _stream_timeout_ms: u64,
     ) -> Result<usize, TransferError> {
-        let result = quic_recv.read(buffer).await.map_err(|_| TransferError::InternalError)?;
+        let result = quic_recv
+            .read(buffer)
+            .await
+            .map_err(|_| TransferError::InternalError)?;
         if let Some(len_read) = result {
             *transfer_bytes += len_read as u64;
             stream_write

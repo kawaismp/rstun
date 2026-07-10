@@ -3,7 +3,7 @@
 //! This module defines the messages used for controlling the tunnel
 //! lifecycle and for coordinating per-packet operations between
 //! client and server.
-use crate::{Tunnel, TunnelMode};
+use crate::Tunnel;
 use anyhow::Result;
 use anyhow::{bail, Context};
 
@@ -53,22 +53,10 @@ impl LoginInfo {
                     String::from("PeerDefault")
                 };
 
-                match cfg.mode {
-                    TunnelMode::Out => {
-                        format!(
-                            "{}_OUT →  {} →  {remote_addr} →  {upstream_str}",
-                            upstream.upstream_type,
-                            cfg.local_server_addr.unwrap()
-                        )
-                    }
-                    TunnelMode::In => {
-                        format!(
-                            "{}_IN ←  {} ←  {remote_addr} ←  {upstream_str}",
-                            upstream.upstream_type,
-                            cfg.local_server_addr.unwrap()
-                        )
-                    }
-                }
+                format!(
+                    "{} →  {} →  {remote_addr} →  {upstream_str}",
+                    upstream.upstream_type, cfg.local_server_addr
+                )
             }
         }
     }
@@ -81,7 +69,7 @@ impl Display for LoginInfo {
                 f.write_str(format!("{upstream_type}_ChannelBased").as_str())
             }
             Tunnel::NetworkBased(cfg) => {
-                f.write_str(format!("{}_{}", cfg.upstream.upstream_type, cfg.mode).as_str())
+                f.write_str(format!("{}", cfg.upstream.upstream_type).as_str())
             }
         }
     }
@@ -107,15 +95,14 @@ impl TunnelMessage {
             .await
             .context("read message failed")?;
 
-        let tun_msg = postcard::from_bytes::<TunnelMessage>(&msg)
-            .context("deserialize message failed")?;
+        let tun_msg =
+            postcard::from_bytes::<TunnelMessage>(&msg).context("deserialize message failed")?;
         Ok(tun_msg)
     }
 
     /// Encode and send a TunnelMessage via the given QUIC send stream.
     pub async fn send(quic_send: &mut SendStream, msg: &TunnelMessage) -> Result<()> {
-        let msg = postcard::to_allocvec(msg)
-            .context("serialize message failed")?;
+        let msg = postcard::to_allocvec(msg).context("serialize message failed")?;
         quic_send.write_u32(msg.len() as u32).await?;
         quic_send.write_all(&msg).await?;
         Ok(())

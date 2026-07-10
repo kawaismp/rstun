@@ -121,25 +121,11 @@ impl Deref for SelectedCipherSuite {
     }
 }
 
-/// Info about an outbound TCP tunnel (client connects to server, server dials upstream).
-#[derive(Debug)]
-pub struct TcpTunnelOutInfo {
-    conn: quinn::Connection,
-    upstream_addr: SocketAddr,
-}
-
 /// Info about an inbound TCP tunnel (client accepts local TCP and forwards to server).
 #[derive(Debug)]
 pub struct TcpTunnelInInfo {
     conn: quinn::Connection,
     tcp_server: TcpServer,
-}
-
-/// Info about an outbound UDP tunnel (client connects to server, server sends to upstream).
-#[derive(Debug)]
-pub struct UdpTunnelOutInfo {
-    conn: quinn::Connection,
-    upstream_addr: SocketAddr,
 }
 
 /// Info about an inbound UDP tunnel (client accepts local UDP and forwards to server).
@@ -152,34 +138,13 @@ pub struct UdpTunnelInInfo {
 /// Negotiated tunnel role and transport type after authentication.
 #[derive(Debug)]
 pub enum TunnelType {
-    /// TCP OUT mode: server will connect to upstream.
-    TcpOut(TcpTunnelOutInfo),
-    /// TCP IN mode: server spawns a local TCP listener for the client.
+    /// TCP IN mode: server will open a tcp port and wait for connections,
+    /// traffic will be forwarded to the client.
     TcpIn(TcpTunnelInInfo),
-    /// UDP OUT mode: server will send/receive datagrams to/from upstream.
-    UdpOut(UdpTunnelOutInfo),
-    /// UDP IN mode: server spawns a local UDP socket for the client.
+
+    /// UDP IN mode: server will open a udp port and wait for datagrams,
+    /// traffic will be forwarded to the client.
     UdpIn(UdpTunnelInInfo),
-    /// Channel-based TCP OUT: upstream decided dynamically by the client.
-    DynamicUpstreamTcpOut(quinn::Connection),
-    /// Channel-based UDP OUT: upstream decided dynamically by the client.
-    DynamicUpstreamUdpOut(quinn::Connection),
-}
-
-/// Direction of a tunnel: Inbound or Outbound relative to the client.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum TunnelMode {
-    In,
-    Out,
-}
-
-impl Display for TunnelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::In => write!(f, "IN"),
-            Self::Out => write!(f, "OUT"),
-        }
-    }
 }
 
 /// Transport type for a tunnel: TCP or UDP.
@@ -219,12 +184,8 @@ impl Display for Upstream {
 /// A single tunnel specification.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TunnelConfig {
-    /// Direction of the tunnel, relative to the client.
-    pub mode: TunnelMode,
-    /// Local listen address for NetworkBased tunnels (Some) or None for ChannelBased.
-    pub local_server_addr: Option<SocketAddr>,
-    /// Upstream config on the server side.
     pub upstream: Upstream,
+    pub local_server_addr: SocketAddr,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -267,11 +228,11 @@ pub struct ClientConfig {
 }
 
 /// Server-side runtime configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone, Default, Debug)]
 pub struct ServerConfig {
-    /// Bind address for the server (host:port).
+    /// e.g. "0.0.0.0:3515"
     pub addr: String,
-    /// Shared password for authentication.
+    /// Must match client's password
     pub password: String,
     /// Path to certificate PEM.
     pub cert_path: String,
@@ -283,11 +244,6 @@ pub struct ServerConfig {
     pub tcp_timeout_ms: u64,
     /// UDP idle timeout (ms).
     pub udp_timeout_ms: u64,
-
-    /// for TunnelOut only
-    pub default_tcp_upstream: Option<SocketAddr>,
-    /// for TunnelOut only
-    pub default_udp_upstream: Option<SocketAddr>,
 
     /// 0.0.0.0:3515
     pub dashboard_server: String,
@@ -351,7 +307,9 @@ impl ClientConfig {
             workers: if workers > 0 {
                 workers
             } else {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
             },
             wait_before_retry_ms,
             quic_timeout_ms,
@@ -381,13 +339,8 @@ fn parse_addr_mappings(
 
     for mapping in mappings.split(',') {
         let parts: Vec<&str> = mapping.split('^').collect();
-        if parts.len() != 3 {
-            log_and_bail!("Invalid mapping format, expected TYPE^SRC^DEST");
-        }
-
-        let tunnel_mode = parts[0];
-        if tunnel_mode != "OUT" && tunnel_mode != "IN" {
-            log_and_bail!("Invalid tunnel type, expected OUT or IN");
+        if parts.len() < 2 || parts.len() > 3 {
+            log_and_bail!("Invalid mapping format, expected bind^dest (or IN^bind^dest)");
         }
 
         let parse_addr = |addr: &str| -> Result<Option<SocketAddr>> {
@@ -410,18 +363,23 @@ fn parse_addr_mappings(
             })?))
         };
 
-        let local_server_addr = parse_addr(parts[1])?;
+        let (bind_str, dest_str) = if parts.len() == 3 && parts[0].eq_ignore_ascii_case("IN") {
+            (parts[1], parts[2])
+        } else if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            log_and_bail!("Invalid mapping format, expected bind^dest (or IN^bind^dest)");
+        };
+
+        let local_server_addr = parse_addr(bind_str)?;
         if local_server_addr.is_none() {
-            log_and_bail!("'ANY' is not allowed as local_server_addr");
+            log_and_bail!("'ANY' is not allowed as bind address");
         }
-        let upstream_addr = parse_addr(parts[2])?;
+        let local_server_addr = local_server_addr.unwrap();
+
+        let upstream_addr = parse_addr(dest_str)?;
 
         v.push(TunnelConfig {
-            mode: if tunnel_mode == "IN" {
-                TunnelMode::In
-            } else {
-                TunnelMode::Out
-            },
             upstream: Upstream {
                 upstream_addr,
                 upstream_type: upstream_type.clone(),
@@ -441,4 +399,3 @@ pub fn socket_addr_with_unspecified_ip_port(ipv6: bool) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     }
 }
-

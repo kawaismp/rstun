@@ -1,0 +1,10 @@
+# rstund server configuration
+bind_address = "0.0.0.0:6060"
+password = "change_this_password"
+workers = 1             # Number of async workers (0 = auto)
+log_level = "info"      # "info", "debug", "error", etc.
+
+[timeouts]
+quic_idle_ms = 40000
+tcp_idle_ms = 30000
+udp_idle_ms = 30000

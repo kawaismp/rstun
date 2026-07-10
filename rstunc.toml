@@ -1,0 +1,21 @@
+# rstunc client configuration
+server_address = "127.0.0.1:6060"
+password = "change_this_password"
+workers = 0             # 0 = auto
+log_level = "info"
+retry_interval_ms = 5000
+connection_migration_interval_ms = 0 # 0 = disabled
+
+[tls]
+cipher = "aes-128-gcm"
+
+[timeouts]
+quic_idle_ms = 30000
+tcp_idle_ms = 30000
+udp_idle_ms = 5000
+
+[[tunnels]]
+name = "Expose my web server"
+protocol = "tcp"
+bind = "127.0.0.1:8080"  # What the server listens on (e.g. your VPS)
+destination = "9000"     # Where the client forwards traffic locally
