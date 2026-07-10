@@ -25,6 +25,12 @@ pub enum TunnelMessage {
     RespFailure(String),
     /// Server ↔ Client: success acknowledgement.
     RespSuccess,
+    /// Server → Client: success, but took over an existing connection.
+    RespSuccessPreempted,
+    /// Server → Client: Are you still alive?
+    Ping,
+    /// Client → Server: Yes, I am.
+    Pong,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -81,6 +87,9 @@ impl Display for TunnelMessage {
             Self::ReqLogin(login_info) => f.write_str(login_info.to_string().as_str()),
             Self::RespFailure(msg) => f.write_str(format!("fail:{msg}").as_str()),
             Self::RespSuccess => f.write_str("succeeded"),
+            Self::RespSuccessPreempted => f.write_str("succeeded (preempted old connection)"),
+            Self::Ping => f.write_str("ping"),
+            Self::Pong => f.write_str("pong"),
         }
     }
 }
@@ -233,7 +242,7 @@ impl TunnelMessage {
     /// Validate a response message, returning Ok for RespSuccess else error.
     pub fn handle_message(msg: &TunnelMessage) -> Result<()> {
         match msg {
-            TunnelMessage::RespSuccess => Ok(()),
+            TunnelMessage::RespSuccess | TunnelMessage::RespSuccessPreempted => Ok(()),
             TunnelMessage::RespFailure(msg) => bail!(format!("received failure, err: {msg}")),
             _ => bail!("unexpected message type"),
         }

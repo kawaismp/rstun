@@ -124,15 +124,17 @@ impl Deref for SelectedCipherSuite {
 /// Info about an inbound TCP tunnel (client accepts local TCP and forwards to server).
 #[derive(Debug)]
 pub struct TcpTunnelInInfo {
-    conn: quinn::Connection,
-    tcp_server: TcpServer,
+    pub bound_port: SocketAddr,
+    pub conn: quinn::Connection,
+    pub tcp_server: TcpServer,
 }
 
 /// Info about an inbound UDP tunnel (client accepts local UDP and forwards to server).
 #[derive(Debug)]
 pub struct UdpTunnelInInfo {
-    conn: quinn::Connection,
-    udp_server: UdpServer,
+    pub bound_port: SocketAddr,
+    pub conn: quinn::Connection,
+    pub udp_server: UdpServer,
 }
 
 /// Negotiated tunnel role and transport type after authentication.

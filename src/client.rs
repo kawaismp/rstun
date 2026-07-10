@@ -585,26 +585,43 @@ impl Client {
         TunnelMessage::send(&mut quic_send, &login_msg).await?;
 
         let resp = TunnelMessage::recv(&mut quic_recv).await?;
-        if let TunnelMessage::RespFailure(msg) = resp {
-            bail!(
-                "{index}:{} failed to login: {msg}",
-                login_info.format_with_remote_addr(remote_addr)
-            );
+        match resp {
+            TunnelMessage::RespSuccess => {}
+            TunnelMessage::RespSuccessPreempted => {
+                self.post_tunnel_log(
+                    format!(
+                        "{index}:{} took over existing dead connection!",
+                        login_info.format_with_remote_addr(remote_addr)
+                    )
+                    .as_str(),
+                );
+            }
+            TunnelMessage::RespFailure(msg) => {
+                bail!(
+                    "{index}:{} failed to login: {msg}",
+                    login_info.format_with_remote_addr(remote_addr)
+                )
+            }
+            _ => bail!("unexpected message type"),
         }
-        if !matches!(resp, TunnelMessage::RespSuccess) {
-            bail!(
-                "{index}:{} unexpected response, failed to login",
-                login_info.format_with_remote_addr(remote_addr)
-            );
-        }
+
         TunnelMessage::handle_message(&resp)?;
         self.post_tunnel_log(
             format!(
-                "{index}:{} login succeeded!",
+                "{index}:{} started",
                 login_info.format_with_remote_addr(remote_addr)
             )
             .as_str(),
         );
+
+        tokio::spawn(async move {
+            while let Ok(msg) = TunnelMessage::recv(&mut quic_recv).await {
+                if matches!(msg, TunnelMessage::Ping) {
+                    TunnelMessage::send(&mut quic_send, &TunnelMessage::Pong).await.ok();
+                }
+            }
+        });
+
         Ok(conn)
     }
 
