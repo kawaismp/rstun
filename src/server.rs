@@ -21,7 +21,7 @@ use parking_lot::{Mutex, Once};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::IdleTimeout;
 use quinn::VarInt;
-use quinn::{congestion, Connection, Endpoint, SendStream, TransportConfig};
+use quinn::{Connection, Endpoint, SendStream, TransportConfig};
 use rs_utilities::log_and_bail;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;

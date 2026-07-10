@@ -15,7 +15,7 @@ use backon::ExponentialBuilder;
 use backon::Retryable;
 use log::{debug, error, info, warn};
 use parking_lot::{Mutex, Once};
-use quinn::{congestion, crypto::rustls::QuicClientConfig, Connection, Endpoint, TransportConfig};
+use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint, TransportConfig};
 use quinn::{IdleTimeout, VarInt};
 use rs_utilities::dns::{self, DNSQueryOrdering, DNSResolverConfig, DNSResolverLookupIpStrategy};
 use rs_utilities::log_and_bail;
