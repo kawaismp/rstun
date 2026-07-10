@@ -37,6 +37,8 @@ impl Display for TransferError {
 
 pub struct StreamUtil {}
 
+const TCP_COPY_BUFFER_SIZE: usize = 64 * 1024;
+
 impl StreamUtil {
     /// Start bidirectional flowing between a local Async stream and a pair of
     /// QUIC send/recv streams. Runs two tasks and logs flow stats.
@@ -62,11 +64,9 @@ impl StreamUtil {
 
         let (quic_to_stream_tx, quic_to_stream_rx) = oneshot::channel::<()>();
         let (stream_to_quic_tx, stream_to_quic_rx) = oneshot::channel::<()>();
-        const BUFFER_SIZE: usize = 8_192; // 8KB
-
         tokio::spawn(async move {
             let mut transfer_bytes = 0u64;
-            let mut buffer = BUFFER_POOL.alloc_and_fill(BUFFER_SIZE);
+            let mut buffer = BUFFER_POOL.alloc_and_fill(TCP_COPY_BUFFER_SIZE);
             loop {
                 let result = Self::quic_to_stream(
                     &mut quic_recv,
@@ -80,12 +80,9 @@ impl StreamUtil {
                 match result {
                     Err(TransferError::TimeoutError) => {
                         let _ = quic_to_stream_tx.send(());
-                        match stream_to_quic_rx.await {
-                            _ => {
-                                // either the sender is dropped or the task times out
-                                break;
-                            }
-                        }
+                        // Wait for the opposite direction to finish its current flow.
+                        let _ = stream_to_quic_rx.await;
+                        break;
                     }
                     Ok(0) | Err(_) => {
                         let _ = quic_to_stream_tx.send(());
@@ -102,7 +99,7 @@ impl StreamUtil {
 
         tokio::spawn(async move {
             let mut transfer_bytes = 0u64;
-            let mut buffer = BUFFER_POOL.alloc_and_fill(BUFFER_SIZE);
+            let mut buffer = BUFFER_POOL.alloc_and_fill(TCP_COPY_BUFFER_SIZE);
             loop {
                 let result = Self::stream_to_quic(
                     &mut stream_read,
@@ -116,12 +113,9 @@ impl StreamUtil {
                 match result {
                     Err(TransferError::TimeoutError) => {
                         let _ = stream_to_quic_tx.send(());
-                        match quic_to_stream_rx.await {
-                            _ => {
-                                // either the sender is dropped or the task times out
-                                break;
-                            }
-                        }
+                        // Wait for the opposite direction to finish its current flow.
+                        let _ = quic_to_stream_rx.await;
+                        break;
                     }
                     Ok(0) | Err(_) => {
                         let _ = stream_to_quic_tx.send(());

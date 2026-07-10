@@ -3,26 +3,24 @@
 //! This module defines the messages used for controlling the tunnel
 //! lifecycle and for coordinating per-packet operations between
 //! client and server.
-use crate::compression;
 use crate::{Tunnel, TunnelMode};
 use anyhow::Result;
 use anyhow::{bail, Context};
 use bincode::config::{self, Configuration};
-use enum_as_inner::EnumAsInner;
 use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(EnumAsInner, Serialize, Deserialize, Debug, Clone)]
+const MAX_UDP_BATCH_BYTES: usize = 128 * 1024;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 /// Control/data messages used during login and per-packet coordination.
 pub enum TunnelMessage {
     /// Client → Server: authenticate and declare desired tunnel.
     ReqLogin(LoginInfo),
-    /// Client → Server: mark the peer address for an upcoming UDP datagram.
-    ReqUdpStart(UdpPeerAddr),
     /// Server → Client: failure with reason.
     RespFailure(String),
     /// Server ↔ Client: success acknowledgement.
@@ -76,10 +74,6 @@ impl LoginInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-/// UDP peer address wrapper used in ReqUdpStart.
-pub struct UdpPeerAddr(pub Option<SocketAddr>);
-
 impl Display for LoginInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.tunnel {
@@ -97,9 +91,6 @@ impl Display for TunnelMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReqLogin(login_info) => f.write_str(login_info.to_string().as_str()),
-            Self::ReqUdpStart(udp_peer_addr) => {
-                f.write_str(format!("udp_start:{udp_peer_addr:?}").as_str())
-            }
             Self::RespFailure(msg) => f.write_str(format!("fail:{msg}").as_str()),
             Self::RespSuccess => f.write_str("succeeded"),
         }
@@ -142,62 +133,117 @@ impl TunnelMessage {
         Ok(())
     }
 
-    /// Receive a raw datagram payload into the provided buffer.
-    /// Data is automatically decompressed if it was compressed.
-    pub async fn recv_raw(quic_recv: &mut RecvStream, data: &mut [u8]) -> Result<u16> {
-        // Read compression flag (1 byte)
-        let compressed = quic_recv.read_u8().await? != 0;
-        
-        // Read message length
-        let msg_len = quic_recv.read_u16().await? as usize;
-        
-        if compressed {
-            // Read compressed data into a temporary buffer
-            let mut compressed_buf = vec![0u8; msg_len];
-            quic_recv
-                .read_exact(&mut compressed_buf)
-                .await
-                .context("read compressed message failed")?;
-            
-            // Decompress
-            let decompressed = compression::decompress(&compressed_buf)
-                .context("decompression failed")?;
-            
-            if decompressed.len() > data.len() {
-                bail!("decompressed message too large: {}", decompressed.len());
-            }
-            
-            data[..decompressed.len()].copy_from_slice(&decompressed);
-            Ok(decompressed.len() as u16)
-        } else {
-            // Uncompressed data
-            if msg_len > data.len() {
-                bail!("message too large: {msg_len}");
-            }
-            quic_recv
-                .read_exact(&mut data[..msg_len])
-                .await
-                .context("read message failed")?;
-            Ok(msg_len as u16)
-        }
+    /// Start a reusable UDP batch with room for its wire-length prefix.
+    pub fn start_udp_batch(output: &mut Vec<u8>) {
+        output.clear();
+        output.extend_from_slice(&[0; 4]);
     }
 
-    /// Send a raw datagram payload with optional compression.
-    /// Data larger than 2048 bytes is automatically compressed if compression reduces size.
-    pub async fn send_raw(quic_send: &mut SendStream, data: &[u8]) -> Result<()> {
-        // Compress if worthwhile (min size: 2048 bytes)
-        let (send_data, compressed) = compression::compress_if_worthwhile(data, 2048)?;
-        
-        // Write compression flag (1 byte)
-        quic_send.write_u8(if compressed { 1 } else { 0 }).await?;
-        
-        // Write message length
-        quic_send.write_u16(send_data.len() as u16).await?;
-        
-        // Write data
-        quic_send.write_all(&send_data).await?;
-        
+    /// Fill in a UDP batch's length prefix before writing it to QUIC.
+    pub fn finish_udp_batch(output: &mut [u8]) -> Result<()> {
+        let body_len = output
+            .len()
+            .checked_sub(4)
+            .context("UDP batch is missing its length prefix")?;
+        let body_len = u32::try_from(body_len).context("UDP batch exceeds 4 GiB")?;
+        output[..4].copy_from_slice(&body_len.to_be_bytes());
         Ok(())
+    }
+
+    /// Append the optional dynamic destination and payload as one compact UDP frame.
+    pub fn append_udp_packet(
+        output: &mut Vec<u8>,
+        peer_addr: Option<SocketAddr>,
+        data: &[u8],
+    ) -> Result<()> {
+        let msg_len = u16::try_from(data.len()).context("datagram payload exceeds 65535 bytes")?;
+        let mut header = [0u8; 21];
+        let mut cursor = 1;
+
+        match peer_addr {
+            None => header[0] = 0,
+            Some(SocketAddr::V4(addr)) => {
+                header[0] = 4;
+                header[cursor..cursor + 4].copy_from_slice(&addr.ip().octets());
+                cursor += 4;
+                header[cursor..cursor + 2].copy_from_slice(&addr.port().to_be_bytes());
+                cursor += 2;
+            }
+            Some(SocketAddr::V6(addr)) => {
+                header[0] = 6;
+                header[cursor..cursor + 16].copy_from_slice(&addr.ip().octets());
+                cursor += 16;
+                header[cursor..cursor + 2].copy_from_slice(&addr.port().to_be_bytes());
+                cursor += 2;
+            }
+        }
+
+        header[cursor..cursor + 2].copy_from_slice(&msg_len.to_be_bytes());
+        cursor += 2;
+        output.reserve(cursor + data.len());
+        output.extend_from_slice(&header[..cursor]);
+        output.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Receive one complete UDP batch with two QUIC reads regardless of packet count.
+    pub async fn recv_udp_batch(quic_recv: &mut RecvStream, data: &mut Vec<u8>) -> Result<()> {
+        let batch_len = quic_recv.read_u32().await? as usize;
+        if batch_len > MAX_UDP_BATCH_BYTES {
+            bail!("UDP batch too large: {batch_len}");
+        }
+        data.resize(batch_len, 0);
+        quic_recv
+            .read_exact(data)
+            .await
+            .context("read UDP batch failed")?;
+        Ok(())
+    }
+
+    /// Decode the next packet from an in-memory UDP batch.
+    pub fn decode_udp_packet<'a>(
+        data: &'a [u8],
+        cursor: &mut usize,
+    ) -> Result<Option<(Option<SocketAddr>, &'a [u8])>> {
+        fn take<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
+            let end = cursor
+                .checked_add(len)
+                .context("UDP frame length overflow")?;
+            let value = data.get(*cursor..end).context("truncated UDP frame")?;
+            *cursor = end;
+            Ok(value)
+        }
+
+        if *cursor == data.len() {
+            return Ok(None);
+        }
+
+        let family = take(data, cursor, 1)?[0];
+        let peer_addr = match family {
+            0 => None,
+            4 => {
+                let encoded = take(data, cursor, 6)?;
+                Some(SocketAddr::new(
+                    Ipv4Addr::new(encoded[0], encoded[1], encoded[2], encoded[3]).into(),
+                    u16::from_be_bytes([encoded[4], encoded[5]]),
+                ))
+            }
+            6 => {
+                let encoded = take(data, cursor, 18)?;
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&encoded[..16]);
+                Some(SocketAddr::new(
+                    Ipv6Addr::from(octets).into(),
+                    u16::from_be_bytes([encoded[16], encoded[17]]),
+                ))
+            }
+            family => bail!("invalid UDP address family marker: {family}"),
+        };
+
+        let encoded_len = take(data, cursor, 2)?;
+        let payload_len = u16::from_be_bytes([encoded_len[0], encoded_len[1]]) as usize;
+        let payload = take(data, cursor, payload_len)?;
+        Ok(Some((peer_addr, payload)))
     }
 
     /// Validate a response message, returning Ok for RespSuccess else error.
@@ -207,5 +253,54 @@ impl TunnelMessage {
             TunnelMessage::RespFailure(msg) => bail!(format!("received failure, err: {msg}")),
             _ => bail!("unexpected message type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TunnelMessage;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn compact_udp_frame_without_peer_address() {
+        let mut frame = Vec::new();
+        TunnelMessage::append_udp_packet(&mut frame, None, b"abc").unwrap();
+        assert_eq!(frame, [0, 0, 3, b'a', b'b', b'c']);
+
+        let mut cursor = 0;
+        let (peer, payload) = TunnelMessage::decode_udp_packet(&frame, &mut cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer, None);
+        assert_eq!(payload, b"abc");
+        assert!(TunnelMessage::decode_udp_packet(&frame, &mut cursor)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn compact_udp_frame_with_ipv4_peer_address() {
+        let mut frame = Vec::new();
+        let peer = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 8080);
+        TunnelMessage::append_udp_packet(&mut frame, Some(peer), b"x").unwrap();
+        assert_eq!(frame, [4, 192, 0, 2, 1, 0x1f, 0x90, 0, 1, b'x']);
+
+        let mut cursor = 0;
+        let (decoded_peer, payload) = TunnelMessage::decode_udp_packet(&frame, &mut cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded_peer, Some(peer));
+        assert_eq!(payload, b"x");
+    }
+
+    #[test]
+    fn compact_udp_frame_with_ipv6_peer_address() {
+        let mut frame = Vec::new();
+        let peer = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 53);
+        TunnelMessage::append_udp_packet(&mut frame, Some(peer), b"z").unwrap();
+        assert_eq!(frame.len(), 22);
+        assert_eq!(frame[0], 6);
+        assert_eq!(&frame[1..17], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(&frame[17..], &[0, 53, 0, 1, b'z']);
     }
 }

@@ -5,9 +5,9 @@
 //! The listener can be installed by the user and, if set, will receive updates
 //! whenever tunnel information is available.
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 #[derive(Serialize, Default, Clone)]
 /// Traffic counters aggregated over time.
@@ -20,6 +20,7 @@ pub(crate) struct TunnelTraffic {
 
 #[derive(Serialize)]
 /// Discriminator for the type of info carried in TunnelInfo.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum TunnelInfoType {
     TunnelState,
     TunnelLog,
@@ -46,10 +47,12 @@ where
     }
 }
 
+type TunnelInfoListener = Arc<Mutex<dyn FnMut(&str) + 'static + Send + Sync>>;
+
 #[derive(Clone)]
 /// Posts serialized tunnel info to a user-provided listener, if installed.
 pub(crate) struct TunnelInfoBridge {
-    listener: Option<Arc<Mutex<dyn FnMut(&str) + 'static + Send + Sync>>>,
+    listener: Option<TunnelInfoListener>,
 }
 
 impl TunnelInfoBridge {

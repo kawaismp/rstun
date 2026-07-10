@@ -9,11 +9,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::error::SendTimeoutError;
 
-#[cfg(target_os = "linux")]
-use std::os::linux::net::TcpStreamExt;
-#[cfg(target_os = "android")]
-use std::os::android::net::TcpStreamExt;
-
 #[derive(Debug, Clone)]
 /// Lightweight TCP listener that forwards accepted connections to a channel.
 pub struct TcpServer {
@@ -55,7 +50,9 @@ impl TcpServer {
                         }
 
                         #[cfg(any(target_os = "linux", target_os = "android"))]
-                        stream.set_quickack(true).expect("failed to set TCP_QUICKACK");
+                        if let Err(e) = stream.set_quickack(true) {
+                            error!("failed to set TCP_QUICKACK: {e}");
+                        }
 
                         {
                             let (terminated, active) = {

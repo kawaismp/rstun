@@ -4,19 +4,14 @@ use anyhow::Result;
 use log::debug;
 use log::error;
 use log::info;
-use log::warn;
+use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
-use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::channel;
 
+use crate::udp::{configure_udp_socket, UDP_CHANNEL_CAPACITY};
 pub use crate::udp::{UdpMessage, UdpPacket, UdpReceiver, UdpSender};
-
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 
 #[derive(Debug, Clone)]
 /// Lightweight UDP helper that binds a local socket and bridges packets via channels.
@@ -34,10 +29,11 @@ impl UdpServer {
     /// Bind to the given address and start the UDP bridging task in background.
     pub async fn bind_and_start(addr: SocketAddr) -> Result<Self> {
         let udp_socket = UdpSocket::bind(addr).await?;
+        configure_udp_socket(&udp_socket);
         let addr = udp_socket.local_addr().unwrap();
 
-        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(4);
-        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(4);
+        let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(UDP_CHANNEL_CAPACITY);
+        let (out_udp_sender, out_udp_receiver) = channel::<UdpMessage>(UDP_CHANNEL_CAPACITY);
 
         let state = Arc::new(Mutex::new(State {
             addr,
@@ -55,9 +51,9 @@ impl UdpServer {
         // Spawn separate recv task
         let recv_state = state.clone();
         tokio::spawn(async move {
+            let mut recv_buffer = vec![0u8; UDP_PACKET_SIZE];
             loop {
-                let mut payload = BUFFER_POOL.alloc_and_fill(UDP_PACKET_SIZE);
-                match recv_socket.recv_from(&mut payload).await {
+                match recv_socket.recv_from(&mut recv_buffer).await {
                     Ok((size, local_addr)) => {
                         let active = recv_state.lock().active;
                         if !active {
@@ -65,19 +61,22 @@ impl UdpServer {
                             continue;
                         }
 
-                        unsafe { payload.set_len(size); }
-                        let msg = UdpMessage::Packet(UdpPacket{payload, local_addr, peer_addr: None});
+                        let mut payload = BUFFER_POOL.alloc_and_fill(size.max(1));
+                        payload[..size].copy_from_slice(&recv_buffer[..size]);
+                        payload.truncate(size);
+                        let msg = UdpMessage::Packet(UdpPacket {
+                            payload,
+                            local_addr,
+                            peer_addr: None,
+                        });
 
-                        // Use try_send to avoid blocking recv loop
-                        match out_udp_sender.try_send(msg) {
-                            Ok(_) => {
-                                // succeeded
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                warn!("outbound UDP channel is full, dropping packet from {local_addr}");
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                error!("receiving end of the channel is closed, will quit recv task");
+                        // Apply backpressure instead of silently dropping a burst in userspace.
+                        match out_udp_sender.send(msg).await {
+                            Ok(_) => {}
+                            Err(_) => {
+                                error!(
+                                    "receiving end of the channel is closed, will quit recv task"
+                                );
                                 break;
                             }
                         }

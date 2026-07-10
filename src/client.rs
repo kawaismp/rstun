@@ -6,12 +6,15 @@ use crate::{
     tunnel_message::TunnelMessage,
     udp::{udp_server::UdpServer, udp_tunnel::UdpTunnel, UdpReceiver, UdpSender},
     ClientConfig, LoginInfo, SelectedCipherSuite, TcpServer, Tunnel, TunnelConfig, TunnelMode,
-    UpstreamType,
+    UpstreamType, QUIC_CONNECTION_WINDOW, QUIC_MAX_CONCURRENT_BIDI_STREAMS, QUIC_SEND_WINDOW,
+    QUIC_STREAM_RECEIVE_WINDOW,
 };
+use ahash::AHashMap;
 use anyhow::{bail, Context, Result};
 use backon::ExponentialBuilder;
 use backon::Retryable;
 use log::{debug, error, info, warn};
+use parking_lot::{Mutex, Once};
 use quinn::{congestion, crypto::rustls::QuicClientConfig, Connection, Endpoint, TransportConfig};
 use quinn::{IdleTimeout, VarInt};
 use rs_utilities::dns::{self, DNSQueryOrdering, DNSResolverConfig, DNSResolverLookupIpStrategy};
@@ -23,7 +26,6 @@ use rustls::{
 };
 use rustls_platform_verifier::{self, BuilderVerifierExt};
 use serde::Serialize;
-use ahash::AHashMap;
 use std::{
     fmt::Display,
     net::{IpAddr, SocketAddr},
@@ -31,7 +33,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use parking_lot::{Mutex, Once};
 use tokio::net::TcpStream;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S.%3f";
@@ -537,11 +538,12 @@ impl Client {
 
     async fn prepare_login_config(&self) -> Result<LoginConfig> {
         let mut transport_cfg = TransportConfig::default();
-        transport_cfg.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024));
-        transport_cfg.receive_window(VarInt::from_u32(8 * 1024 * 1024));
-        transport_cfg.send_window(8 * 1024 * 1024);
+        transport_cfg.stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
+        transport_cfg.receive_window(VarInt::from_u32(QUIC_CONNECTION_WINDOW));
+        transport_cfg.send_window(QUIC_SEND_WINDOW);
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+        transport_cfg
+            .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS));
 
         if self.config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(self.config.quic_timeout_ms as u32));
@@ -552,7 +554,9 @@ impl Client {
         }
 
         let (tls_client_cfg, domain) = self.parse_client_config_and_domain()?;
-        let mut client_cfg: quinn::ClientConfig = quinn::ClientConfig::new(Arc::new(NoProtectionClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_client_cfg)?))));
+        let mut client_cfg: quinn::ClientConfig = quinn::ClientConfig::new(Arc::new(
+            NoProtectionClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_client_cfg)?)),
+        ));
         client_cfg.transport_config(Arc::new(transport_cfg));
 
         let remote_addr = self.parse_server_addr().await?;
@@ -612,7 +616,7 @@ impl Client {
                 login_info.format_with_remote_addr(remote_addr)
             );
         }
-        if !resp.is_resp_success() {
+        if !matches!(resp, TunnelMessage::RespSuccess) {
             bail!(
                 "{index}:{} unexpected response, failed to login",
                 login_info.format_with_remote_addr(remote_addr)

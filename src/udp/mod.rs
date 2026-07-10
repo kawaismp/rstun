@@ -7,6 +7,39 @@ use byte_pool::Block;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+pub(crate) const UDP_CHANNEL_CAPACITY: usize = 1024;
+
+/// Increase kernel buffering for burst tolerance. The OS may cap this value
+/// according to its global socket-buffer limits.
+pub(crate) fn configure_udp_socket(socket: &tokio::net::UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let size: libc::c_int = 4 * 1024 * 1024;
+        for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            let result = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            };
+            if result != 0 {
+                log::warn!(
+                    "failed to enlarge UDP socket buffer: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = socket;
+}
+
 /// Message types used by the UDP server/tunnel tasks.
 pub enum UdpMessage {
     /// A datagram with metadata about source/destination.

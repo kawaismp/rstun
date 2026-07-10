@@ -10,13 +10,14 @@ use crate::tunnel_message::TunnelMessage;
 use crate::udp::udp_server::{UdpMessage, UdpSender};
 use crate::udp::{udp_server::UdpServer, udp_tunnel::UdpTunnel};
 use crate::{
-    noprotection::NoProtectionServerConfig,
-    pem_util, ServerConfig, TcpServer, TcpTunnelInInfo, TcpTunnelOutInfo, Tunnel, TunnelConfig,
-    TunnelMode, TunnelType, UdpTunnelInInfo, UdpTunnelOutInfo, UpstreamType,
-    SUPPORTED_CIPHER_SUITES,
+    noprotection::NoProtectionServerConfig, pem_util, ServerConfig, TcpServer, TcpTunnelInInfo,
+    TcpTunnelOutInfo, Tunnel, TunnelConfig, TunnelMode, TunnelType, UdpTunnelInInfo,
+    UdpTunnelOutInfo, UpstreamType, QUIC_CONNECTION_WINDOW, QUIC_MAX_CONCURRENT_BIDI_STREAMS,
+    QUIC_SEND_WINDOW, QUIC_STREAM_RECEIVE_WINDOW, SUPPORTED_CIPHER_SUITES,
 };
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
+use parking_lot::{Mutex, Once};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::IdleTimeout;
 use quinn::VarInt;
@@ -25,7 +26,6 @@ use rs_utilities::log_and_bail;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use parking_lot::{Mutex, Once};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 
@@ -140,9 +140,9 @@ impl Server {
             .unwrap();
 
         let mut transport_cfg = TransportConfig::default();
-        transport_cfg.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024));
-        transport_cfg.receive_window(VarInt::from_u32(8 * 1024 * 1024));
-        transport_cfg.send_window(8 * 1024 * 1024);
+        transport_cfg.stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
+        transport_cfg.receive_window(VarInt::from_u32(QUIC_CONNECTION_WINDOW));
+        transport_cfg.send_window(QUIC_SEND_WINDOW);
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
 
         if config.quic_timeout_ms > 0 {
@@ -151,9 +151,12 @@ impl Server {
             transport_cfg
                 .keep_alive_interval(Some(Duration::from_millis(config.quic_timeout_ms * 2 / 3)));
         }
-        transport_cfg.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+        transport_cfg
+            .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS));
 
-        let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(Arc::new(QuicServerConfig::try_from(tls_server_cfg)?))));
+        let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            NoProtectionServerConfig::new(Arc::new(QuicServerConfig::try_from(tls_server_cfg)?)),
+        ));
         quinn_server_cfg.transport_config(Arc::new(transport_cfg));
 
         Ok(quinn_server_cfg)
@@ -185,7 +188,7 @@ impl Server {
                             Some(info.upstream_addr),
                             config.tcp_timeout_ms,
                         )
-                            .await;
+                        .await;
                     }
 
                     TunnelType::UdpOut(info) => {
@@ -194,17 +197,14 @@ impl Server {
                             Some(info.upstream_addr),
                             config.udp_timeout_ms,
                         )
-                            .await
+                        .await
                     }
 
                     TunnelType::TcpIn(mut info) => {
-                        state
-                            .lock()
-                            .tcp_sessions
-                            .push(ConnectedTcpInSession {
-                                conn: info.conn.clone(),
-                                sender: info.tcp_server.clone_sender(),
-                            });
+                        state.lock().tcp_sessions.push(ConnectedTcpInSession {
+                            conn: info.conn.clone(),
+                            sender: info.tcp_server.clone_sender(),
+                        });
 
                         let mut tcp_receiver = info.tcp_server.take_receiver();
 
@@ -215,19 +215,16 @@ impl Server {
                             &mut None,
                             config.tcp_timeout_ms,
                         )
-                            .await;
+                        .await;
 
                         info.tcp_server.shutdown().await.ok();
                     }
 
                     TunnelType::UdpIn(mut info) => {
-                        state
-                            .lock()
-                            .udp_sessions
-                            .push(ConnectedUdpInSession {
-                                conn: info.conn.clone(),
-                                sender: info.udp_server.clone_sender(),
-                            });
+                        state.lock().udp_sessions.push(ConnectedUdpInSession {
+                            conn: info.conn.clone(),
+                            sender: info.udp_server.clone_sender(),
+                        });
 
                         let mut udp_receiver = info.udp_server.take_receiver();
                         let udp_sender = info.udp_server.clone_sender();
@@ -238,7 +235,7 @@ impl Server {
                             &mut udp_receiver,
                             config.udp_timeout_ms,
                         )
-                            .await;
+                        .await;
 
                         info.udp_server.shutdown().await.ok();
                     }
@@ -335,7 +332,7 @@ impl Server {
                                 quic_send,
                                 format!("udp server failed to bind at: {upstream_addr}"),
                             )
-                                .await?;
+                            .await?;
                             log_and_bail!("tcp_IN login rejected: {e}");
                         }
                     };
@@ -352,7 +349,7 @@ impl Server {
                                 quic_send,
                                 format!("udp server failed to bind at: {upstream_addr}"),
                             )
-                                .await?;
+                            .await?;
                             log_and_bail!("udp_IN login rejected: {e}");
                         }
                     };

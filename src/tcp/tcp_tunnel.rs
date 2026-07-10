@@ -38,11 +38,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-#[cfg(target_os = "linux")]
-use std::os::linux::net::TcpStreamExt;
-#[cfg(target_os = "android")]
-use std::os::android::net::TcpStreamExt;
-
 pub struct TcpTunnel;
 
 impl TcpTunnel {
@@ -144,7 +139,9 @@ impl TcpTunnel {
                             }
 
                             #[cfg(any(target_os = "linux", target_os = "android"))]
-                            request.set_quickack(true).expect("failed to set TCP_QUICKACK");
+                            if let Err(e) = request.set_quickack(true) {
+                                error!("failed to set TCP_QUICKACK: {e}");
+                            }
 
                             StreamUtil::start_flowing(
                                 "OUT",
@@ -152,7 +149,7 @@ impl TcpTunnel {
                                 (quic_send, quic_recv),
                                 stream_timeout_ms,
                             )
-                        },
+                        }
                         Ok(Err(e)) => error!("failed to connect to {dst_addr}, err: {e}"),
                         Err(_) => error!("timeout connecting to {dst_addr}"),
                     }

@@ -12,22 +12,21 @@ This fork includes several performance optimizations and enhancements based on m
 
 ### **Disabled QUIC Encryption for Internal Tunnels**
 - QUIC encryption overhead is removed for the internal tunnel connections between server and client
-- Traffic is still protected by TLS at the outer layer, but internal QUIC payload encryption is disabled
+- TLS is still used for the QUIC handshake, but application payloads are not encrypted or authenticated
 - Results in **lower CPU usage** and **reduced latency** for high-throughput scenarios
-- Ideal for trusted server-client connections where TLS already provides adequate security
+- This mode is intended only for trusted networks where transport security is not required
 
-### **Snappy Compression**
-- Automatic **Snappy compression** applied to all tunnel data on top of QUIC
-- Intelligently compresses data only when beneficial (>256 bytes and reduces size)
-- Provides **40-70% bandwidth reduction** for compressible data (HTTP, JSON, text, etc.)
-- Minimal CPU overhead with Snappy's fast compression algorithm
-- Transparent compression/decompression - no configuration needed
-- Debug logging shows compression statistics for monitoring
+### **Low-overhead UDP forwarding**
+- Ready UDP packets are opportunistically batched without adding a batching timer
+- Compact fixed-width framing avoids per-packet serialization and temporary payload allocations
+- UDP streams expire only when both directions are idle, so one-way traffic remains stable
+- 1,024-packet userspace queues and best-effort 4 MiB kernel socket buffers absorb short bursts
+- Reliable QUIC streams preserve packets across network loss instead of silently discarding them
 
 ### **Performance Optimizations**
-- **Increased QUIC buffer sizes**: 4MB stream receive window, 8MB connection receive/send windows
-- **Optimized TCP socket settings**: TCP_NODELAY, increased socket buffers (512KB), TCP_QUICKACK on Linux
-- **Optimized UDP socket settings**: Increased UDP socket buffers (2MB) for better throughput
+- **Increased QUIC flow control**: 16 MiB stream receive window and 64 MiB connection receive/send windows
+- **Optimized TCP forwarding**: TCP_NODELAY, TCP_QUICKACK on Linux/Android, and reusable 64 KiB copy buffers
+- **Optimized UDP socket settings**: Best-effort 4 MiB receive/send buffers for better burst tolerance
 - **Higher stream limits**: Supports up to 4096 concurrent bidirectional streams
 
 ### **Why These Changes?**
@@ -35,10 +34,11 @@ This fork includes several performance optimizations and enhancements based on m
 These optimizations are designed for scenarios where:
 - Server and client have a **trusted connection** (e.g., your own infrastructure)
 - You need **maximum performance** with minimal latency
-- **Bandwidth costs** are a concern (compression helps significantly)
 - You're transferring **large amounts of data** or handling **high connection counts**
 
-⚠️ **Security Note**: With QUIC encryption disabled, ensure your server-client connection is over a trusted network or that TLS provides sufficient security for your use case.
+⚠️ **Security Note**: QUIC payload encryption and authentication are disabled. Do not use this build on an untrusted network unless another layer provides the required protection.
+
+⚠️ **Compatibility Note**: The batched UDP wire format is not compatible with older releases. Upgrade the client and server together.
 
 ---
 
@@ -46,7 +46,7 @@ These optimizations are designed for scenarios where:
 
 - **Multiple TCP and UDP tunnels**: Support for running multiple tunnels (TCP and/or UDP) simultaneously in a single client or server instance.
 - **Bidirectional tunneling**: Both inbound (IN) and outbound (OUT) modes for flexible deployment.
-- **Modern encryption**: Security via QUIC's TLS 1.3 layer, with configurable cipher suites.
+- **TLS-based QUIC handshake**: Certificate handling and configurable TLS 1.3 cipher selection; payload protection is deliberately disabled in this build.
 - **Automatic or custom certificates**: Use your own certificate/key or let rstun generate a self-signed certificate for testing.
 - **Connection migration**: Optional periodic migration of QUIC connection to new random local UDP ports to avoid throttling during long data transfers.
 - **Traffic statistics**: Real-time tunnel traffic reporting.

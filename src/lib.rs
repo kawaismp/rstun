@@ -7,7 +7,6 @@
 //! Binaries rstunc (client) and rstund (server) are provided under src/bin.
 
 mod client;
-mod compression;
 mod noprotection;
 mod pem_util;
 mod server;
@@ -21,7 +20,6 @@ use anyhow::{Context, Result};
 use byte_pool::BytePool;
 pub use client::Client;
 pub use client::ClientState;
-use lazy_static::lazy_static;
 use log::warn;
 use rs_utilities::log_and_bail;
 use rustls::crypto::ring::cipher_suite;
@@ -32,7 +30,7 @@ use std::fmt::Display;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
-use std::{net::SocketAddr, ops::Deref};
+use std::{net::SocketAddr, ops::Deref, sync::LazyLock};
 pub use tcp::tcp_server::TcpServer;
 pub use tcp::{AsyncStream, StreamMessage, StreamReceiver, StreamRequest, StreamSender};
 use tunnel_message::LoginInfo;
@@ -40,18 +38,20 @@ use udp::udp_server::UdpServer;
 pub use udp::{UdpMessage, UdpPacket, UdpReceiver, UdpSender};
 
 extern crate bincode;
-extern crate pretty_env_logger;
 
 /// Human-readable tunnel direction used in CLI/config strings.
 pub const TUNNEL_MODE_IN: &str = "IN";
 /// Human-readable tunnel direction used in CLI/config strings.
 pub const TUNNEL_MODE_OUT: &str = "OUT";
-/// Maximum UDP payload size (bytes) used by this crate.
-pub const UDP_PACKET_SIZE: usize = 1350;
+/// Maximum UDP payload size representable by the tunnel wire format.
+pub const UDP_PACKET_SIZE: usize = u16::MAX as usize;
 
-lazy_static! {
-    static ref BUFFER_POOL: BytePool::<Vec<u8>> = BytePool::<Vec<u8>>::new();
-}
+static BUFFER_POOL: LazyLock<BytePool<Vec<u8>>> = LazyLock::new(BytePool::new);
+
+pub(crate) const QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+pub(crate) const QUIC_CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+pub(crate) const QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
+pub(crate) const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 4096;
 
 /// List of supported TLS cipher suites (as CLI-friendly strings).
 ///
@@ -456,9 +456,9 @@ pub mod android {
     use self::jni::sys::{jboolean, jint, JNI_TRUE, JNI_VERSION_1_6};
     use self::jni::{JNIEnv, JavaVM};
     use super::*;
+    use parking_lot::Mutex;
     use std::os::raw::c_void;
     use std::sync::Arc;
-    use parking_lot::Mutex;
     use std::thread;
 
     #[no_mangle]
