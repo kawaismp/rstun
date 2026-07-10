@@ -5,6 +5,9 @@
 //!
 //! This binary is built as part of the `rstun` crate.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 use clap::builder::PossibleValuesParser;
 use clap::builder::TypedValueParser as _;
