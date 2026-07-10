@@ -542,6 +542,7 @@ impl Client {
         transport_cfg.receive_window(VarInt::from_u32(QUIC_CONNECTION_WINDOW));
         transport_cfg.send_window(QUIC_SEND_WINDOW);
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+        transport_cfg.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
         transport_cfg
             .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS));
 

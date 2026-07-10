@@ -144,6 +144,7 @@ impl Server {
         transport_cfg.receive_window(VarInt::from_u32(QUIC_CONNECTION_WINDOW));
         transport_cfg.send_window(QUIC_SEND_WINDOW);
         transport_cfg.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+        transport_cfg.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
 
         if config.quic_timeout_ms > 0 {
             let timeout = IdleTimeout::from(VarInt::from_u32(config.quic_timeout_ms as u32));
