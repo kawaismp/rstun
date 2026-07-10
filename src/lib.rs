@@ -37,8 +37,6 @@ use tunnel_message::LoginInfo;
 use udp::udp_server::UdpServer;
 pub use udp::{UdpMessage, UdpPacket, UdpReceiver, UdpSender};
 
-extern crate bincode;
-
 /// Human-readable tunnel direction used in CLI/config strings.
 pub const TUNNEL_MODE_IN: &str = "IN";
 /// Human-readable tunnel direction used in CLI/config strings.

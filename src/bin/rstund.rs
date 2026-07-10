@@ -31,9 +31,16 @@ fn main() {
 
     info!("will use {} workers", workers);
 
-    tokio::runtime::Builder::new_multi_thread()
+    let mut builder = if workers == 1 {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.worker_threads(workers);
+        b
+    };
+
+    builder
         .enable_all()
-        .worker_threads(workers)
         .build()
         .unwrap()
         .block_on(async {

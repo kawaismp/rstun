@@ -39,9 +39,6 @@ fn main() {
 
     if let Ok(config) = config {
         let mut client = Client::new(config);
-
-
-
         client.start_tunneling();
     }
 }
